@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Geometry for the closed-cavity thermal layout benchmark (doc 04, section 1,
-v2 parameters: 5 cm aerogel, 5 cm wall frame, cavity [0.05, 0.95]^2,
+v3 parameters: 1 cm aerogel, 5 cm wall frame, cavity [0.05, 0.95]^2,
 disk device 20 W).
 
 Domains (physical coordinates [m]):
-    tbl    : aerogel layer  [-0.05, 0] x [0, 1]   (only when not USE_TBL_1D)
+    tbl    : aerogel layer  [-0.01, 0] x [0, 1]   (only when not USE_TBL_1D)
     wall_* : aluminum frame split into four strips:
              wall_l [0, 0.05]x[0, 1]        wall_r [0.95, 1]x[0, 1]
              wall_b [0.05, 0.95]x[0, 0.05]  wall_t [0.05, 0.95]x[0.95, 1]

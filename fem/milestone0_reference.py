@@ -40,7 +40,7 @@ from dolfinx.fem.petsc import LinearProblem
 # ---------------------------------------------------------------- parameters
 P = dict(
     # geometry [m]
-    x_tbl=-0.05,            # aerogel outer face
+    x_tbl=-0.01,            # aerogel outer face
     w_in=0.05,              # wall inner offset (frame thickness)
     d1=0.2,  P1=300.0,      # device 1: small square on bottom wall
     d2=0.35, P2=600.0,      # device 2: large square on top wall

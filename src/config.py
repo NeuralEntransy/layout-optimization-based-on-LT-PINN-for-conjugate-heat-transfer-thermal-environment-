@@ -18,7 +18,7 @@ conductivity ratios only enter the interface flux-continuity losses.
 import math
 
 # ---------------------------------------------------------------- geometry [m]
-X_TBL = -0.05           # aerogel outer face (cold side)
+X_TBL = -0.01           # aerogel outer face (cold side)
 W_IN = 0.05             # wall frame thickness / cavity inner offset
 D1, D2 = 0.2, 0.35      # device 1 / 2 side lengths
 C3 = (0.5, 0.4)         # device 3 (fixed disk) center
@@ -51,9 +51,9 @@ K_TBL = 0.018       # aerogel
 # h_TBL = k_TBL / l_TBL.  Set USE_TBL_1D = False to resolve the layer as a
 # separate domain instead (kept for comparison).
 USE_TBL_1D = True
-L_TBL = abs(X_TBL)                  # 0.005 m
-H_TBL = K_TBL / L_TBL               # 3.6 W/m^2/K
-RPP_TBL = L_TBL / K_TBL             # 0.2778 m^2 K/W
+L_TBL = abs(X_TBL)                  # 0.01 m
+H_TBL = K_TBL / L_TBL               # 1.8 W/m^2/K
+RPP_TBL = L_TBL / K_TBL             # 0.556 m^2 K/W
 
 # ---------------------------------------------------------------- environment
 T_COLD = 218.15     # left Dirichlet [K]  (-55 C)
@@ -69,7 +69,7 @@ THETA_COLD = 0.0
 THETA_INF = 1.0
 THETA_LIM = (T_LIM - T_C) / DT          # 1.4706
 BI = H_EXT * L_REF / K_AL               # 0.0898 (right Robin)
-BI_TBL = H_TBL * L_REF / K_AL           # 0.02156 (left aerogel Robin)
+BI_TBL = H_TBL * L_REF / K_AL           # 0.01078 (left aerogel Robin)
 S1 = Q1 * L_REF ** 2 / (K_AL * DT)      # 0.528
 S2 = Q2 * L_REF ** 2 / (K_AL * DT)      # 0.345
 S3 = Q3 * L_REF ** 2 / (K_AL * DT)      # 0.336
@@ -92,7 +92,7 @@ PDE_W_OF_DOMAIN = dict(tbl=1.0, wall_l=1.0, wall_r=1.0, wall_b=1.0,
 
 # Per-domain PDE residual scale (only relevant for the resolved-layer
 # variant; with USE_TBL_1D the thin aerogel domain is absent).
-PDE_RES_SCALE = dict(tbl=(0.025 ** 2), wall_l=1.0, wall_r=1.0,
+PDE_RES_SCALE = dict(tbl=(0.005 ** 2), wall_l=1.0, wall_r=1.0,
                      wall_b=1.0, wall_t=1.0, air=1.0,
                      dev1=1.0, dev2=1.0, dev3=1.0)
 

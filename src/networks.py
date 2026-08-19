@@ -23,7 +23,7 @@ import geometry as G
 
 # fixed input affine transforms: z = (x - center) / scale
 _INPUT_NORM = dict(
-    tbl=((-0.025, 0.5), (0.025, 0.5)),
+    tbl=((-0.005, 0.5), (0.005, 0.5)),
     wall_l=((0.025, 0.5), (0.025, 0.5)),
     wall_r=((0.975, 0.5), (0.025, 0.5)),
     wall_b=((0.5, 0.025), (0.45, 0.025)),
