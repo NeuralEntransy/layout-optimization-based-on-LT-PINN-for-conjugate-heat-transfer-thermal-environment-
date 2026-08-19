@@ -1,202 +1,341 @@
-# import tools
-import os
-import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
+# -*- coding: utf-8 -*-
+"""
+Milestone 1: solid thermal bridges + pure multi-material conduction
+====================================================================
+Reproduction plan: docs/04_复现方案.md, section 6 (Milestone 1).
+
+Physics: steady conduction in 6 subdomains (aerogel / Al wall frame /
+stagnant cavity air / 3 devices with volumetric heat sources).
+Buoyancy and radiation are switched OFF. Interfaces impose temperature +
+flux continuity; outer BCs: left Dirichlet 218.15 K, top/bottom adiabatic,
+right Robin (h = 15 W/m^2/K, T_inf = 303.15 K).
+
+The two design variables x1/x2 are created through the sigmoid
+parameterization of geometry.DesignVars but are FROZEN in milestone 1
+(fixed layout validation against the milestone-0 FEM reference).
+
+Usage (torch env):
+    python src/main.py --layout center --epochs 30000
+    python src/main.py --layout center --power-scale 0.1 --epochs 2000  # debug
+    python src/main.py --layout center --resume                          # continue
+
+Outputs:
+    <ckptdir>/latest.pt, loss_log.csv, final_report.json
+    <outdir>/  (shared with validate.py results)
+"""
+import argparse
 import csv
-import math
-import matplotlib.pyplot as plt
+import json
+import os
 import time
-import loss
-import NeuralNetwork
+
+import numpy as np
+import torch
+
+import config as C
+import geometry as G
+import monitors as M
+from networks import TemperatureField
+from losses import ConductionLoss, InterfaceLoss, BoundaryLoss, \
+    EnergyBudgetLoss
+
+# old 3.1.2 checkpoints live in ../checkpoint and must NOT be touched here
+DEFAULT_CKPT_ROOT = os.path.join(os.path.dirname(__file__), "..",
+                                 "checkpoint_m1")
 
 
-## set global parameters
-device = torch.device("cuda:0")
-torch.manual_seed(20231028)
-torch.set_default_dtype(torch.float32)
+def parse_args():
+    p = argparse.ArgumentParser(description="Milestone 1 conduction PINN")
+    p.add_argument("--layout", default="center", choices=list(C.LAYOUTS),
+                   help="fixed layout name from config.LAYOUTS")
+    p.add_argument("--x1", type=float, default=None, help="override layout x1")
+    p.add_argument("--x2", type=float, default=None, help="override layout x2")
+    p.add_argument("--epochs", type=int, default=C.TRAIN["epochs"],
+                   help="Adam-phase epochs")
+    p.add_argument("--lbfgs-steps", type=int, default=0,
+                   help="L-BFGS polish steps after the Adam phase "
+                        "(quasi-Newton handles the stiff coupled valley)")
+    p.add_argument("--lbfgs-max-iter", type=int, default=20)
+    p.add_argument("--lbfgs-history", type=int, default=50)
+    p.add_argument("--lbfgs-resample", type=int, default=100,
+                   help="resample collocation points every N L-BFGS steps "
+                        "(0 = keep fixed)")
+    p.add_argument("--lr", type=float, default=C.TRAIN["lr"])
+    p.add_argument("--width", type=int, default=C.TRAIN["width"])
+    p.add_argument("--depth", type=int, default=C.TRAIN["depth"])
+    p.add_argument("--power-scale", type=float, default=1.0,
+                   help="final heat-source scale")
+    p.add_argument("--power-start", type=float, default=None,
+                   help="ramp start scale (default: = power-scale, no ramp)")
+    p.add_argument("--ramp", choices=["none", "linear", "exp"],
+                   default="exp", help="power continuation schedule")
+    p.add_argument("--ramp-frac", type=float, default=0.8,
+                   help="fraction of epochs over which power ramps up")
+    p.add_argument("--w-pde", type=float, default=C.TRAIN["w_pde"])
+    p.add_argument("--w-pde-dev", type=float, default=C.TRAIN["w_pde_dev"])
+    p.add_argument("--w-eng", type=float, default=C.TRAIN["w_eng"])
+    p.add_argument("--halo-lr-mult", type=float, default=5.0,
+                   help="learning-rate multiplier for the halo amplitude "
+                        "parameter (direct amplitude channel)")
+    p.add_argument("--w-if-T", type=float, default=C.TRAIN["w_if_T"])
+    p.add_argument("--w-if-q", type=float, default=C.TRAIN["w_if_q"])
+    p.add_argument("--w-bc", type=float, default=C.TRAIN["w_bc"])
+    p.add_argument("--fourier-sigma", type=float, default=None,
+                   help="override per-domain Fourier sigma globally "
+                        "(default: per-domain table in networks.py; "
+                        "0 disables Fourier features)")
+    p.add_argument("--fourier-dim", type=int, default=64)
+    p.add_argument("--theta-init", type=float, default=0.0,
+                   help="uniform warm-start temperature level (theta units)")
+    p.add_argument("--seed", type=int, default=C.TRAIN["seed"])
+    p.add_argument("--device", default="auto")
+    p.add_argument("--resume", action="store_true",
+                   help="load <ckptdir>/latest.pt (default: fresh start)")
+    p.add_argument("--init-from", default=None,
+                   help="warm-start field weights from another checkpoint "
+                        "(fresh optimizer/scheduler; for power ramp stages)")
+    p.add_argument("--eval-every", type=int, default=C.TRAIN["eval_every"])
+    p.add_argument("--save-every", type=int, default=C.TRAIN["save_every"])
+    p.add_argument("--ckptdir", default=None)
+    p.add_argument("--outdir", default=None)
+    return p.parse_args()
 
 
 def main():
+    args = parse_args()
 
-    # read data
-    def load_data(filename):
-        data_pd = pd.read_csv(filename, encoding='gbk',header=None)
-        data = np.array(data_pd)
-        return data[1:,:].copy().astype(float)
-    
-    data = load_data('../../../data/heat_128x128.csv')
+    device = torch.device(
+        "cuda:0" if (args.device == "auto" and torch.cuda.is_available())
+        else args.device if args.device != "auto" else "cpu")
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    torch.set_default_dtype(torch.float32)
 
-    Lx_max = 0
-    Lx_min = 0
-    Ly_max = 0
-    Ly_min = 0
-    
+    x1_0, x2_0 = C.LAYOUTS[args.layout]
+    x1_0 = args.x1 if args.x1 is not None else x1_0
+    x2_0 = args.x2 if args.x2 is not None else x2_0
 
-    data_xy = data[:,0:2]
-    data_xy[:,0] = data_xy[:,0]+7.5
-    data_u = data[:,3:]-273 # normalize to 273K
-    x_temp = data_xy[:,0]
-    y_temp = data_xy[:,1]   
-    idx = (x_temp<=1.1) & (x_temp>=-1.1) & (y_temp<=Ly_max+1.1) & (y_temp>=Ly_min-1.1)   
-    x_all = data_xy[idx]
-    y_all = data_u[idx]
+    tag = args.layout if (args.x1 is None and args.x2 is None) else "custom"
+    if args.power_scale != 1.0:
+        tag += f"_ps{args.power_scale:g}"
+    ckptdir = args.ckptdir or os.path.join(DEFAULT_CKPT_ROOT, tag)
+    outdir = args.outdir or os.path.join(
+        os.path.dirname(__file__), "..", "results", "milestone1", tag)
+    os.makedirs(ckptdir, exist_ok=True)
+    os.makedirs(outdir, exist_ok=True)
 
-    
-    # test point
-    x_temp = x_all[:,0]
-    y_temp = x_all[:,1]
-    idx = (x_temp<=1) & (x_temp>=-1) & (y_temp<=Ly_max+1) & (y_temp>=Ly_min-1)
-    x_test = x_all[idx]
-    y_test = y_all[idx]
-    X_test = torch.tensor(x_test,dtype=torch.float32,device=device)
-    Y_test = torch.tensor(y_test,dtype=torch.float32,device=device)
-    
-    
-    # supervise point
-    x_temp = x_all[:,0]
-    y_temp = x_all[:,1]
-    idx = (x_temp>1) | (x_temp<-1) | (y_temp>1) | (y_temp<-1)
-    x_sup = x_all[idx]
-    y_sup = y_all[idx]
-    
-#    # add some supervise data
-    idx = np.random.choice(len(x_test),int(0.1*len(x_test)),replace=False)
-    x_sup_ = x_test[idx]
-    y_sup_ = y_test[idx]
-    
-#    X_sup = torch.tensor(np.concatenate((x_sup,x_sup_),axis=0),dtype=torch.float32,device=device)
-#    Y_sup = torch.tensor(np.concatenate((y_sup,y_sup_),axis=0),dtype=torch.float32,device=device)
-    X_sup = torch.tensor(x_sup_,dtype=torch.float32,device=device)
-    Y_sup = torch.tensor(y_sup_,dtype=torch.float32,device=device)
+    # ------------------------------------------------------------ build model
+    field = TemperatureField(args.width, args.depth,
+                             theta_init=args.theta_init,
+                             fourier_sigma=args.fourier_sigma,
+                             fourier_dim=args.fourier_dim).to(device)
+    design = G.DesignVars(x1_0, x2_0, trainable=False, device=device)
+    x1, x2 = design.x1(), design.x2()          # frozen tensors (milestone 1)
 
-    
-    # internal collocation point
-    num_points_unit = 60
-    num_points_x = int((Lx_max-Lx_min+2)*num_points_unit)  
-    num_points_y = int((Ly_max-Ly_min+2)*num_points_unit) 
-    x = np.linspace(-1, 1, num_points_x)
-    y = np.linspace(Ly_min-1, Ly_max+1, num_points_y)
-    X, Y = np.meshgrid(x, y)
-    x_internal = np.stack((X.flatten(), Y.flatten()), axis=1)
-    X_internal = torch.tensor(x_internal,dtype=torch.float32,device=device)
-    X_internal.requires_grad = True
-    
-    print('test:',X_test.shape,Y_test.shape,'sup:',X_sup.shape,Y_sup.shape,'Internal:',X_internal.shape)
-    
-    # boundary point
-    
-    def get_circle_points(center_x, center_y): 
-        theta = torch.linspace(0, 2 * torch.pi, 256, requires_grad=False,device=device)
-        all_points = []
-        for dr in range(4):
-            x = center_x + (0.5-0.1*dr)*torch.cos(theta)
-            y = center_y + (0.5-0.1*dr)*torch.sin(theta)
-            points = torch.stack((x, y), dim=1)  
-            all_points.append(points)
-        all_points = torch.cat(all_points, dim=0)
-        return all_points
+    condLoss = ConductionLoss(field, power_scale=args.power_scale,
+                              w_dev=args.w_pde_dev)
+    ifaceLoss = InterfaceLoss(field)
+    bcLoss = BoundaryLoss(field)
+    engLoss = EnergyBudgetLoss(field)
 
-    
-    
-    # define trainable network 
-    numCenter = 1
-    nn_fun = NeuralNetwork.MyNet(2,1,256,4,numCenter)
-    nn_fun = nn_fun.cuda()
-    
-    # load ckp
-    try:
-        load_param = torch.load('../checkpoint/nn_fun_params')
-        nn_fun.load_state_dict(load_param)
-    except:
-        print('no saved network')
-        
-    train_parameters =  list(nn_fun.parameters())
-        
-    # define optimizer  
-    optimizer = torch.optim.Adam(lr=1e-4,params=train_parameters)
-    try:
-        load_param = torch.load('../checkpoint/opt_params')
-        optimizer.load_state_dict(load_param)
-    except:
-        print('no saved opt')
+    net_params = [p for n, p in field.named_parameters()
+                  if n != "halo_A"]
+    param_groups = [{"params": net_params, "lr": args.lr}]
+    if getattr(field, "halo", False):
+        param_groups.append({"params": [field.halo_A],
+                             "lr": args.lr * args.halo_lr_mult})
+    optimizer = torch.optim.Adam(param_groups, lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2)
 
-    # define loss
-    dataLoss = loss.DataLoss(nn_fun)
-    pdeLoss = loss.PDELoss(nn_fun,Lx_min,Lx_max,Ly_min,Ly_max)
-    bcLoss = loss.BCLoss(nn_fun,Lx_min,Lx_max,Ly_min,Ly_max)
-    
-    # train 
-    wData = 1e4
-    wEq = 1.0
-    wBc = 1.0
-    wTp = 1.0
-    loss_sup = 0.0
-    loss_eq = 0.0
-    loss_test = 0.0
-    loss_bc = 0.0
-    loss_tp = 0.0
-    
-    for epoch in range(1,400001):
-        
-        time0 = time.time()
-        
-        # calculate cylinder center
-        
-        X_center = (Lx_max-Lx_min+2)*torch.sigmoid(nn_fun.X_center.weight[0,0])+(Lx_min-1)
-        Y_center = (Ly_max-Ly_min+2)*torch.sigmoid(nn_fun.Y_center.weight[0,0])+(Ly_min-1)
-        
-        # data loss
-        loss_sup,_ = dataLoss(X_sup,Y_sup)
-        loss_sup =  wData * loss_sup
-        loss_sup.backward()
-        
-        # bc loss
-        X_bc = get_circle_points(X_center,Y_center)
-        loss_bc = wBc * bcLoss(X_bc)
-        
-        # equation loss            
-        loss_eq = wEq * pdeLoss(X_internal)
+    start_epoch = 1
+    ckpt_path = os.path.join(ckptdir, "latest.pt")
+    if args.resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        field.load_state_dict(ck["field"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        start_epoch = ck["epoch"] + 1
+        print(f"[resume] from {ckpt_path} @ epoch {ck['epoch']}")
+    elif args.init_from and os.path.exists(args.init_from):
+        ck = torch.load(args.init_from, map_location=device,
+                        weights_only=False)
+        field.load_state_dict(ck["field"])
+        print(f"[warm-start] field weights from {args.init_from} "
+              f"(epoch {ck['epoch']}); fresh optimizer")
+    else:
+        print("[fresh] training from scratch "
+              "(old 3.1.2 checkpoints are never loaded)")
 
-        # topology loss
-#        loss_tp = wTp * (Y_center)**2
-        
-        (loss_bc+loss_eq).backward()
-        
-        # test monitor
-        with torch.no_grad():
-            loss_test,monitor_test = dataLoss(X_test,Y_test)
+    print(f"layout={tag}  x1={float(x1):.4f}  x2={float(x2):.4f}  "
+          f"device={device}  power_scale={args.power_scale}")
+    print(f"ckptdir={ckptdir}\noutdir={outdir}")
 
-        optimizer.step()        
+    log_path = os.path.join(ckptdir, "loss_log.csv")
+    log_header = ["epoch", "loss", "pde", "if_T", "if_q", "bc", "eng",
+                  "Q_left", "Q_right", "Q_robin", "balance_err",
+                  "Tmax1_C", "Tmax2_C", "Tmax3_C", "lr", "sec"]
+    if start_epoch == 1 or not os.path.exists(log_path):
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(log_header)
+
+    # ------------------------------------------------------------ train loop
+    nd = C.TRAIN["n_dom"]
+    n_if, n_bnd = C.TRAIN["n_iface"], C.TRAIN["n_bnd"]
+
+    def compute_loss(dom_samples, if_samples, bnd_samples):
+        l_pde, _ = condLoss(dom_samples)
+        l_ifT, l_ifq, _ = ifaceLoss(if_samples)
+        l_bc, _ = bcLoss(bnd_samples)
+        engLoss.power_scale = condLoss.power_scale
+        l_eng, _ = engLoss(if_samples, bnd_samples)
+        loss = (args.w_pde * l_pde + args.w_if_T * l_ifT
+                + args.w_if_q * l_ifq + args.w_bc * l_bc
+                + args.w_eng * l_eng)
+        return loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng)
+
+    # Continuous power continuation: the physical solution is O(power) away
+    # from the trivial flat state, so a slow ramp lets the field track the
+    # moving target instead of crossing a loss barrier at fixed power.
+    p_start = args.power_start if args.power_start is not None \
+        else args.power_scale
+
+    def power_at(epoch):
+        f = min(epoch / max(1.0, args.ramp_frac * args.epochs), 1.0)
+        if args.ramp == "exp" and p_start > 0:
+            return p_start * (args.power_scale / p_start) ** f
+        if args.ramp == "linear":
+            return p_start + (args.power_scale - p_start) * f
+        return args.power_scale
+
+    t_start = time.time()
+    for epoch in range(start_epoch, args.epochs + 1):
+        t0 = time.time()
+        condLoss.power_scale = power_at(epoch)
+
+        dom_samples = {d: G.sample_domain(d, nd[d], x1, x2, device)
+                       for d in G.DOMAINS}
+        if_samples = G.sample_all_interfaces(n_if, x1, x2, device)
+        bnd_samples = G.sample_boundaries(n_bnd, device)
+
+        loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(
+            dom_samples, if_samples, bnd_samples)
+
         optimizer.zero_grad()
-        loss_total = loss_sup + loss_eq + loss_bc
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
 
-        time1 = time.time()
-        
+        if epoch % args.eval_every == 0 or epoch == args.epochs:
+            ps_now = condLoss.power_scale
+            flux = M.energy_report(field, device, ps_now, n=257)
+            tmax = M.device_Tmax(field, float(x1), float(x2), device, n=41)
+            row = [epoch, float(loss), float(l_pde), float(l_ifT),
+                   float(l_ifq), float(l_bc), float(l_eng),
+                   flux["Q_left"], flux["Q_right"], flux["Q_right_robin"],
+                   flux["balance_err"],
+                   tmax["dev1"] - 273.15, tmax["dev2"] - 273.15,
+                   tmax["dev3"] - 273.15,
+                   scheduler.get_last_lr()[0], time.time() - t0]
+            with open(log_path, "a", newline="") as f:
+                csv.writer(f).writerow(row)
+            print(f"ep {epoch:6d}  loss {float(loss):.3e}  "
+                  f"pde {float(l_pde):.2e}  ifT {float(l_ifT):.2e}  "
+                  f"ifq {float(l_ifq):.2e}  bc {float(l_bc):.2e}  "
+                  f"eng {float(l_eng):.2e} | "
+                  f"Q_L {flux['Q_left']:7.1f}  Q_R {flux['Q_right']:7.1f}  "
+                  f"bal {flux['balance_err']:.2e} | "
+                  f"T1 {tmax['dev1']-273.15:6.1f}C  T2 {tmax['dev2']-273.15:6.1f}C  "
+                  f"T3 {tmax['dev3']-273.15:6.1f}C", flush=True)
 
-        
-        if epoch % 100 == 0:
-            print('epoch:',epoch,'loss:',float(loss_total),'loss_sup:',float(loss_sup),'loss_eq:',float(loss_eq),'loss_bc:',float(loss_bc),'loss_tp:',float(loss_tp),'loss_test:',float(loss_test),'monitor_test:',float(monitor_test),'center',float(X_center),float(Y_center),time1-time0)
-'''        
-        if epoch % 1000 == 0:
-            loss_log = [epoch,float(loss_total),float(loss_sup),float(loss_eq),float(loss_bc),float(loss_tp),float(loss_test),float(monitor_test),float(X_center),float(Y_center)]
-            with open('../checkpoint/loss_log.csv', 'a') as file:
-                writer = csv.writer(file)
-                writer.writerow(loss_log)
+        if epoch % args.save_every == 0 or epoch == args.epochs:
+            torch.save(dict(field=field.state_dict(),
+                            optimizer=optimizer.state_dict(),
+                            scheduler=scheduler.state_dict(),
+                            design=dict(z1=float(design.z1),
+                                        z2=float(design.z2)),
+                            epoch=epoch, args=vars(args)), ckpt_path)
 
-        if epoch % 1000 == 0:
-            torch.save(nn_fun.state_dict(),'../checkpoint/nn_fun_params')
-            torch.save(optimizer.state_dict(),'../checkpoint/opt_params')
+    # ------------------------------------------------------------ L-BFGS phase
+    # The coupled device-paraboloid -> interface-flux -> air-hotspot chain
+    # forms a stiff valley for first-order optimizers; L-BFGS (quasi-Newton)
+    # takes big steps along it.  Collocation points are fixed per step block.
+    if args.lbfgs_steps > 0:
+        condLoss.power_scale = args.power_scale
+        print(f"[lbfgs] {args.lbfgs_steps} steps at fixed power "
+              f"{args.power_scale:g}")
+        lb = torch.optim.LBFGS(
+            field.parameters(), max_iter=args.lbfgs_max_iter,
+            history_size=args.lbfgs_history, tolerance_grad=1e-10,
+            tolerance_change=1e-14, line_search_fn="strong_wolfe")
 
-        if epoch % 100000 == 0:
-            torch.save(nn_fun.state_dict(),'../checkpoint/nn_fun_'+str(epoch))
-            torch.save(optimizer.state_dict(),'../checkpoint/opt_params_'+str(epoch))
-'''
-      
- 
-         
-if __name__ == '__main__':
-    
+        def _samples():
+            return ({d: G.sample_domain(d, nd[d], x1, x2, device)
+                     for d in G.DOMAINS},
+                    G.sample_all_interfaces(n_if, x1, x2, device),
+                    G.sample_boundaries(n_bnd, device))
+
+        fixed = _samples()
+        for step in range(1, args.lbfgs_steps + 1):
+            if args.lbfgs_resample and step % args.lbfgs_resample == 0:
+                fixed = _samples()
+
+            def closure():
+                lb.zero_grad()
+                l, _ = compute_loss(*fixed)
+                l.backward()
+                return l
+
+            t0 = time.time()
+            l_val = lb.step(closure)
+            if step % 10 == 0 or step == args.lbfgs_steps:
+                _, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(*fixed)
+                flux = M.energy_report(field, device, args.power_scale,
+                                       n=257)
+                tmax = M.device_Tmax(field, float(x1), float(x2), device,
+                                     n=41)
+                epoch_tag = args.epochs + step
+                row = [epoch_tag, float(l_val), float(l_pde), float(l_ifT),
+                       float(l_ifq), float(l_bc), float(l_eng),
+                       flux["Q_left"], flux["Q_right"],
+                       flux["Q_right_robin"], flux["balance_err"],
+                       tmax["dev1"] - 273.15, tmax["dev2"] - 273.15,
+                       tmax["dev3"] - 273.15, -1.0, time.time() - t0]
+                with open(log_path, "a", newline="") as f:
+                    csv.writer(f).writerow(row)
+                print(f"lb {step:5d}  loss {float(l_val):.3e}  "
+                      f"pde {float(l_pde):.2e}  ifT {float(l_ifT):.2e}  "
+                      f"ifq {float(l_ifq):.2e}  bc {float(l_bc):.2e}  "
+                      f"eng {float(l_eng):.2e} | "
+                      f"Q_L {flux['Q_left']:7.1f}  "
+                      f"Q_R {flux['Q_right']:7.1f}  "
+                      f"bal {flux['balance_err']:.2e} | "
+                      f"T1 {tmax['dev1']-273.15:6.1f}C  "
+                      f"T2 {tmax['dev2']-273.15:6.1f}C  "
+                      f"T3 {tmax['dev3']-273.15:6.1f}C", flush=True)
+            if step % 50 == 0 or step == args.lbfgs_steps:
+                torch.save(dict(field=field.state_dict(),
+                                optimizer=optimizer.state_dict(),
+                                scheduler=scheduler.state_dict(),
+                                design=dict(z1=float(design.z1),
+                                            z2=float(design.z2)),
+                                epoch=args.epochs + step,
+                                args=vars(args)), ckpt_path)
+
+    # ------------------------------------------------------------ final report
+    condLoss.power_scale = args.power_scale       # ensure full-power metrics
+    report = M.full_report(field, float(x1), float(x2), device,
+                           args.power_scale)
+    report.update(dict(layout=tag, x1=float(x1), x2=float(x2),
+                       power_scale=args.power_scale, epochs=args.epochs,
+                       wall_time_min=(time.time() - t_start) / 60))
+    with open(os.path.join(outdir, "final_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    print("\n=== final report ===")
+    print(json.dumps(report, indent=2))
+    print(f"\ncheckpoint: {ckpt_path}\nreport: {outdir}/final_report.json")
+    print("next: python src/validate.py --layout", args.layout)
+
+
+if __name__ == "__main__":
     main()
-
