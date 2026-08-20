@@ -37,15 +37,16 @@ EPS = 0.8
 
 
 # --------------------------------------------------------------------------- #
-def solve_conduction(domain, cell_tags, ftags, hfun, sfun, V):
-    """One linear(ized) conduction solve with radiation linearized about the
-    current state (Newton-Picard split):
-        q_rad,i ~ (eps/(1-eps)) (sigma T_i^4 - J_i)
-                ~= h_k T_i + c_k,
-        h_k = (eps/(1-eps)) 4 sigma T_k^3        (implicit, lhs)
-        c_k = (eps/(1-eps)) (-3 sigma T_k^4 - J_k)  (explicit, rhs)
-    hfun / sfun are CG1 nodal functions on the cavity surface: hfun holds
-    h_k, sfun holds (eps/(1-eps))(3 sigma T_k^4 + J_k).
+def solve_conduction(domain, cell_tags, ftags, hfun, sfun, V, right_bc):
+    """One linear conduction solve with the radiation surface flux applied as
+        q_applied,i = q_rad,i(T_k) + h_loc,i (T_i - T_k,i),
+        h_loc,i = 4 eps sigma T_k,i^3   (local isolated-surface sensitivity)
+    where q_rad(T_k) is the EXACT radiosity net flux at the current iterate
+    (net ~0 over the closed enclosure).  The implicit h_loc*T term goes to
+    the lhs (a += hfun T v dS), the constant (h_loc*T_k - q_rad) to the rhs
+    (L += sfun v dS).  At T = T_k the applied flux equals the exact radiosity
+    flux -> energy is conserved at convergence (needs tight surface tol).
+    right_bc: 'robin' (h_ext convection to 30 C) or 'dirichlet' (clamp 30 C).
     """
     T, v = ufl.TrialFunction(V), ufl.TestFunction(V)
     Q = fem.functionspace(domain, ("DG", 0))
@@ -64,24 +65,31 @@ def solve_conduction(domain, cell_tags, ftags, hfun, sfun, V):
     dS = ufl.Measure("dS", domain=domain, subdomain_data=ftags)
 
     a = k_fun * ufl.dot(ufl.grad(T), ufl.grad(v)) * dx \
-        + P["h_ext"] * T * v * ds(B_RIGHT) \
         + hfun * ufl.avg(T) * ufl.avg(v) * dS(CAVITY)
-    L = q_fun * v * dx + P["h_ext"] * P["T_inf"] * v * ds(B_RIGHT) \
-        + sfun * ufl.avg(v) * dS(CAVITY)
+    L = q_fun * v * dx + sfun * ufl.avg(v) * dS(CAVITY)
 
     left_facets = ftags.find(B_LEFT)
     left_dofs = fem.locate_dofs_topological(V, 1, left_facets)
-    bc = fem.dirichletbc(fem.Constant(domain, P["T_cold"]), left_dofs, V)
+    bcs = [fem.dirichletbc(fem.Constant(domain, P["T_cold"]), left_dofs, V)]
 
-    problem = LinearProblem(a, L, bcs=[bc], petsc_options_prefix="m0r_",
+    if right_bc == "robin":
+        a += P["h_ext"] * T * v * ds(B_RIGHT)
+        L += P["h_ext"] * P["T_inf"] * v * ds(B_RIGHT)
+    else:  # dirichlet: clamp right wall outer face to T_inf
+        right_facets = ftags.find(B_RIGHT)
+        right_dofs = fem.locate_dofs_topological(V, 1, right_facets)
+        bcs.append(fem.dirichletbc(fem.Constant(domain, P["T_inf"]),
+                                   right_dofs, V))
+
+    problem = LinearProblem(a, L, bcs=bcs, petsc_options_prefix="m0r_",
                             petsc_options={"ksp_type": "cg", "pc_type": "gamg",
                                            "ksp_rtol": 1e-12,
                                            "ksp_atol": 1e-14})
     return problem.solve()
 
 
-def solve_layout_radiation(name, x1, x2, outdir, picard_tol=0.02,
-                           max_iter=150):
+def solve_layout_radiation(name, x1, x2, outdir, picard_tol=1e-3,
+                           max_iter=400, right_bc="robin"):
     domain, cell_tags, facet_tags = build_mesh(x1, x2)
     V = fem.functionspace(domain, ("Lagrange", 2))
     V1 = fem.functionspace(domain, ("Lagrange", 1))
@@ -123,8 +131,8 @@ def solve_layout_radiation(name, x1, x2, outdir, picard_tol=0.02,
                       round(float(cavity["p2"][i, 1]), 9))]
         facet_dofs.append((d1, d2))
 
-    qfun_h = fem.Function(V1)   # implicit radiation coefficient h_k
-    qfun_s = fem.Function(V1)   # explicit source (eps/(1-eps))(3 sigma T^4+J)
+    qfun_h = fem.Function(V1)   # implicit radiation coefficient h_loc
+    qfun_s = fem.Function(V1)   # source h_loc*T_k - q_rad(T_k)
     qfun_h.x.array[:] = 0.0
     qfun_s.x.array[:] = 0.0
 
@@ -138,41 +146,48 @@ def solve_layout_radiation(name, x1, x2, outdir, picard_tol=0.02,
         fun.x.array[:] = 0.0
         fun.x.array[mask] = acc[mask] / cnt[mask]
 
-    # ---------------- Newton-Picard iteration over the T^4 nonlinearity
-    Th = solve_conduction(domain, cell_tags, ft, qfun_h, qfun_s, V)
+    # ---------------- fixed-point iteration over the T^4 nonlinearity
+    # radiation reference = EXACT radiosity (conservative net ~0); implicit
+    # local term h_loc = 4 eps sigma T^3 stabilizes; converge tightly on the
+    # surface temperature so the applied flux matches the exact one.
+    Th = solve_conduction(domain, cell_tags, ft, qfun_h, qfun_s, V, right_bc)
     history = []
     converged = False
-    last_q_rad = np.zeros(len(cavity["mid"]))
-    epsfac = EPS / (1.0 - EPS)
+    q_applied = np.zeros(len(cavity["mid"]))
+    Tm_prev = None
     for it in range(1, max_iter + 1):
         Tm = _eval_at(Th, np.column_stack([cavity["mid"],
                                            np.zeros(len(cavity["mid"]))]))
         Tm = np.asarray(Tm, dtype=float).ravel()
         Tm = np.maximum(Tm, 1.0)             # guard against nonphysical cold
         q_rad, J, G = rad.radiosity(Tm, F, EPS)
-        last_q_rad = q_rad
+        q_applied = q_rad
 
-        h_k = epsfac * 4.0 * rad.SIGMA * Tm ** 3
-        s_k = epsfac * (3.0 * rad.SIGMA * Tm ** 4 + J)
-        set_nodal(qfun_h, h_k)
-        set_nodal(qfun_s, s_k)
+        h_loc = 4.0 * EPS * rad.SIGMA * Tm ** 3
+        s_loc = h_loc * Tm - q_rad
+        set_nodal(qfun_h, h_loc)
+        set_nodal(qfun_s, s_loc)
 
-        Th = solve_conduction(domain, cell_tags, ft, qfun_h, qfun_s, V)
+        Th = solve_conduction(domain, cell_tags, ft, qfun_h, qfun_s, V,
+                              right_bc)
 
         X = V.tabulate_dof_coordinates()
         tmax = device_tmax(x1, x2, X, Th.x.array)
         history.append(dict(iter=it, **{k: v for k, v in tmax.items()}))
-        qrad_net = float((q_rad * cavity["length"] * P["b"]).sum())
-        print(f"[{name}] it {it}: Tmax dev1 {tmax['dev1']-273.15:.1f}C "
-              f"dev2 {tmax['dev2']-273.15:.1f}C dev3 {tmax['dev3']-273.15:.1f}C "
-              f"| q_rad conservation {qrad_net:.2e} W", flush=True)
-        if it >= 2:
-            prev = np.array([history[-2][k] for k in ("dev1", "dev2", "dev3")])
-            cur = np.array([history[-1][k] for k in ("dev1", "dev2", "dev3")])
-            if np.abs(cur - prev).max() < picard_tol:
-                converged = True
-                print(f"[{name}] converged at iter {it}", flush=True)
-                break
+        dmax = (np.abs(Tm - Tm_prev).max() if Tm_prev is not None
+                else np.inf)
+        Tm_prev = Tm
+        if it % 10 == 0 or it < 4:
+            qrad_net = float((q_rad * cavity["length"] * P["b"]).sum())
+            print(f"[{name}] it {it}: Tmax dev1 {tmax['dev1']-273.15:.1f}C "
+                  f"dev2 {tmax['dev2']-273.15:.1f}C dev3 {tmax['dev3']-273.15:.1f}C "
+                  f"| dTsurf {dmax:.3f}K | q_rad net {qrad_net:.2e} W",
+                  flush=True)
+        if dmax < picard_tol:
+            converged = True
+            print(f"[{name}] converged at iter {it} (surface dT={dmax:.2e})",
+                  flush=True)
+            break
 
     # ---------------- final diagnostics
     n = ufl.FacetNormal(domain)
@@ -191,7 +206,7 @@ def solve_layout_radiation(name, x1, x2, outdir, picard_tol=0.02,
 
     Q_left, Q_right = flux(B_LEFT), flux(B_RIGHT)
     # net radiation over the closed enclosure must be ~0 (redistribution only)
-    Q_rad_total = float((last_q_rad * cavity["length"] * P["b"]).sum())
+    Q_rad_total = float((q_applied * cavity["length"] * P["b"]).sum())
     P_in = P["P_tot"]
     bal = abs(P_in - Q_left - Q_right) / P_in
 
@@ -199,6 +214,7 @@ def solve_layout_radiation(name, x1, x2, outdir, picard_tol=0.02,
     tmax = device_tmax(x1, x2, X, Th.x.array)
     result = dict(
         layout=name, x1=x1, x2=x2, radiation=True, eps=EPS,
+        right_bc=right_bc,
         n_cavity_facets=len(cavity["mid"]),
         view_factor_checks=checks,
         T_max_C={k: v - 273.15 for k, v in tmax.items()},
@@ -250,12 +266,13 @@ def device_tmax(x1, x2, X, Tv):
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "results/milestone0_radiation"
     only = sys.argv[2].split(",") if len(sys.argv) > 2 else list(LAYOUTS)
+    right_bc = sys.argv[3] if len(sys.argv) > 3 else "robin"
     all_results = {}
     for name in only:
         x1, x2 = LAYOUTS[name]["x1"], LAYOUTS[name]["x2"]
-        print(f"\n=== layout {name} + radiation: x1={x1}, x2={x2} ===",
-              flush=True)
-        res = solve_layout_radiation(name, x1, x2, outdir)
+        print(f"\n=== layout {name} + radiation: x1={x1}, x2={x2}, "
+              f"right_bc={right_bc} ===", flush=True)
+        res = solve_layout_radiation(name, x1, x2, outdir, right_bc=right_bc)
         all_results[name] = res
         print(json.dumps({k: res[k] for k in
                           ["T_max_C", "feasible_all_below_70C", "Q_left_W",

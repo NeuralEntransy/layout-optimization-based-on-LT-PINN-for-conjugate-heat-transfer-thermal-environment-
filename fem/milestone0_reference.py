@@ -40,10 +40,10 @@ from dolfinx.fem.petsc import LinearProblem
 # ---------------------------------------------------------------- parameters
 P = dict(
     # geometry [m]
-    x_tbl=-0.01,            # aerogel outer face
-    w_in=0.05,              # wall inner offset (frame thickness)
-    d1=0.2,  P1=300.0,      # device 1: small square on bottom wall
-    d2=0.35, P2=600.0,      # device 2: large square on top wall
+    x_tbl=-0.005,            # aerogel outer face
+    w_in=0.01,              # wall inner offset (frame thickness)
+    d1=0.2,  P1=200.0,      # device 1: small square on bottom wall
+    d2=0.35, P2=400.0,      # device 2: large square on top wall
     c3=(0.5, 0.4), R3=0.1, P3=20.0,    # device 3: fixed disk
     b=1.0,                  # extrusion thickness
     # materials
@@ -179,7 +179,7 @@ def _eval_at(func, pts3):
     return func.eval(pts3, cells)
 
 
-def solve_layout(name, x1, x2, outdir, power_scale=1.0):
+def solve_layout(name, x1, x2, outdir, power_scale=1.0, right_bc="robin"):
     domain, cell_tags, facet_tags = build_mesh(x1, x2)
     V = fem.functionspace(domain, ("Lagrange", 2))
     T, v = ufl.TrialFunction(V), ufl.TestFunction(V)
@@ -200,16 +200,25 @@ def solve_layout(name, x1, x2, outdir, power_scale=1.0):
     dx = ufl.Measure("dx", domain=domain, subdomain_data=cell_tags)
     ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
 
-    a = k_fun * ufl.dot(ufl.grad(T), ufl.grad(v)) * dx \
-        + P["h_ext"] * T * v * ds(B_RIGHT)
-    L = q_fun * v * dx + P["h_ext"] * P["T_inf"] * v * ds(B_RIGHT)
+    a = k_fun * ufl.dot(ufl.grad(T), ufl.grad(v)) * dx
+    L = q_fun * v * dx
 
     # left Dirichlet
     left_facets = facet_tags.find(B_LEFT)
     left_dofs = fem.locate_dofs_topological(V, 1, left_facets)
-    bc = fem.dirichletbc(fem.Constant(domain, P["T_cold"]), left_dofs, V)
+    bcs = [fem.dirichletbc(fem.Constant(domain, P["T_cold"]), left_dofs, V)]
 
-    problem = LinearProblem(a, L, bcs=[bc], petsc_options_prefix="m0_",
+    # right boundary: Robin convection OR Dirichlet (ideal 30 C heat sink)
+    if right_bc == "robin":
+        a += P["h_ext"] * T * v * ds(B_RIGHT)
+        L += P["h_ext"] * P["T_inf"] * v * ds(B_RIGHT)
+    else:  # dirichlet: clamp right wall outer face to T_inf
+        right_facets = facet_tags.find(B_RIGHT)
+        right_dofs = fem.locate_dofs_topological(V, 1, right_facets)
+        bcs.append(fem.dirichletbc(fem.Constant(domain, P["T_inf"]),
+                                   right_dofs, V))
+
+    problem = LinearProblem(a, L, bcs=bcs, petsc_options_prefix="m0_",
                             petsc_options={
         "ksp_type": "cg", "pc_type": "gamg",
         "ksp_rtol": 1e-12, "ksp_atol": 1e-14})
@@ -225,6 +234,7 @@ def solve_layout(name, x1, x2, outdir, power_scale=1.0):
 
     Q_left, Q_right = flux(B_LEFT), flux(B_RIGHT)
     Q_top, Q_bottom = flux(B_TOP), flux(B_BOTTOM)
+    # Robin cross-check only meaningful for the robin variant
     Q_right_robin = fem.assemble_scalar(fem.form(
         P["h_ext"] * (Th - P["T_inf"]) * ds(B_RIGHT))) * P["b"]
     P_in = P["P_tot"] * power_scale
@@ -268,6 +278,7 @@ def solve_layout(name, x1, x2, outdir, power_scale=1.0):
 
     result = dict(
         layout=name, x1=x1, x2=x2, power_scale=power_scale,
+        right_bc=right_bc,
         n_cells=domain.topology.index_map(2).size_local,
         n_dofs=V.dofmap.index_map.size_local,
         T_max_K=T_max, T_max_C={k: v - 273.15 for k, v in T_max.items()},
@@ -317,13 +328,17 @@ def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else "results/milestone0"
     only = sys.argv[2].split(",") if len(sys.argv) > 2 else list(LAYOUTS)
     power_scale = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+    right_bc = sys.argv[4] if len(sys.argv) > 4 else "robin"
     all_results = {}
     for name in only:
         x1, x2 = LAYOUTS[name]["x1"], LAYOUTS[name]["x2"]
         print(f"\n=== layout {name}: x1={x1}, x2={x2}, "
-              f"power_scale={power_scale} ===", flush=True)
-        res = solve_layout(name, x1, x2, outdir, power_scale)
+              f"power_scale={power_scale}, right_bc={right_bc} ===",
+              flush=True)
+        res = solve_layout(name, x1, x2, outdir, power_scale, right_bc)
         suffix = name if power_scale == 1.0 else f"{name}_ps{power_scale:g}"
+        if right_bc != "robin":
+            suffix += f"_{right_bc}"
         all_results[suffix] = res
         print(json.dumps({k: res[k] for k in
                           ["T_max_C", "feasible_all_below_70C", "Q_left_W",

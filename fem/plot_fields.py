@@ -35,5 +35,5 @@ for ax, name in zip(axes, layouts):
     fig.colorbar(cf, ax=ax, label="T [°C]", shrink=0.85)
 fig.suptitle("Milestone 0 FEM reference\n"
              "(color card clipped to [-55, 70] °C; cyan contour = 70 °C limit)")
-fig.savefig(os.path.join(outdir, f"{prefix}all_layouts.png"), dpi=150)
+fig.savefig(os.path.join(outdir, f"{prefix}all_layouts.png"), dpi=300)
 print("saved", os.path.join(outdir, f"{prefix}all_layouts.png"))
