@@ -5,7 +5,8 @@ Monitoring / acceptance metrics for milestone 1 (doc 04, section 7.2).
 All quantities are computed from the PINN field with input-gradients enabled
 but detached from the training graph.
 
-  * boundary heat rates  Q_left / Q_right (+ Robin cross-check) / Q_top / Q_bottom
+  * boundary heat rates Q_left / Q_right / Q_top / Q_bottom
+  * right Dirichlet temperature error (or Robin heat-rate cross-check)
   * total energy balance vs P_TOT * power_scale
   * per-device T_max (dense evaluation)
   * mounting-interface continuity errors (dev1|wall, dev2|wall)
@@ -63,8 +64,10 @@ def _grid(x0, x1_, y0, y1, n, device):
     return torch.stack([GX.ravel(), GY.ravel()], dim=1)
 
 
-def boundary_fluxes(field, device, n=1025):
+def boundary_fluxes(field, device, n=1025, right_bc=C.RIGHT_BC):
     """Heat rates [W] leaving the domain through each outer boundary."""
+    if right_bc not in {"dirichlet", "robin"}:
+        raise ValueError(f"unsupported right boundary: {right_bc}")
     if C.USE_TBL_1D:
         # heat leaving through the 1-D aerogel resistance = wall flux at x=0
         # (outward normal -x):  Q = integral k_Al dT/dx dy  (x increasing
@@ -94,10 +97,17 @@ def boundary_fluxes(field, device, n=1025):
                                 _line2(C.X_TBL, 0, 0.0, 65, device),
                                 1, C.K_TBL, sign=-1.0, device=device)
         Q_bottom += q_tbl_b * abs(C.X_TBL)
-    Q_right_robin = float(C.H_EXT * C.DT *
-                          (th_r - C.THETA_INF).mean() * 1.0 * C.B)
+    right_err_K = C.DT * (th_r - C.THETA_INF)
+    Q_right_robin = None
+    if right_bc == "robin":
+        Q_right_robin = float(C.H_EXT * C.DT *
+                              (th_r - C.THETA_INF).mean() * 1.0 * C.B)
     return dict(Q_left=Q_left, Q_left_robin=Q_left_robin,
                 Q_right=Q_right, Q_right_robin=Q_right_robin,
+                right_bc=right_bc,
+                right_T_rms_err_K=float(torch.sqrt(
+                    torch.mean(right_err_K ** 2))),
+                right_T_max_err_K=float(torch.max(torch.abs(right_err_K))),
                 Q_top=Q_top, Q_bottom=Q_bottom)
 
 
@@ -108,8 +118,9 @@ def _line2(x0, x1_, y, n, device):
     return p
 
 
-def energy_report(field, device, power_scale=1.0, n=1025):
-    fl = boundary_fluxes(field, device, n)
+def energy_report(field, device, power_scale=1.0, n=1025,
+                  right_bc=C.RIGHT_BC):
+    fl = boundary_fluxes(field, device, n, right_bc)
     P = C.P_TOT * power_scale
     fl["P_in"] = P
     fl["balance_err"] = abs(P - fl["Q_left"] - fl["Q_right"]) / P
@@ -117,7 +128,7 @@ def energy_report(field, device, power_scale=1.0, n=1025):
     return fl
 
 
-def aerogel_check(field, device, n=401):
+def aerogel_check(field, device, n=401, right_bc=C.RIGHT_BC):
     """dT across the aerogel vs the 1D resistance prediction q'' * R''.
     With USE_TBL_1D the layer is a Robin BC: dT = theta(0)*DT and the 1D
     relation holds by construction; still cross-checked against the FEM
@@ -126,7 +137,8 @@ def aerogel_check(field, device, n=401):
         pts = _line(0.0, 1e-4, 1 - 1e-4, n, device)
         with torch.no_grad():
             T_x0 = (C.T_C + C.DT * field("wall_l", pts)).mean()
-        Q_left = boundary_fluxes(field, device, n=1025)["Q_left"]
+        Q_left = boundary_fluxes(field, device, n=1025,
+                                 right_bc=right_bc)["Q_left"]
         q_pp = Q_left / C.B / 1.0
         dT = float(T_x0 - C.T_COLD)
         return dict(dT=dT, dT_1D=q_pp * C.RPP_TBL, q_left_Wm2=q_pp,
@@ -135,7 +147,8 @@ def aerogel_check(field, device, n=401):
     pts = _line(0.0, 1e-4, 1 - 1e-4, n, device)
     with torch.no_grad():
         T_x0 = (C.T_C + C.DT * field("tbl", pts)).mean()
-    Q_left = boundary_fluxes(field, device, n=1025)["Q_left"]
+    Q_left = boundary_fluxes(field, device, n=1025,
+                             right_bc=right_bc)["Q_left"]
     q_pp = Q_left / C.B / 1.0
     Rpp = abs(C.X_TBL) / C.K_TBL
     dT = float(T_x0 - C.T_COLD)
@@ -167,11 +180,19 @@ def mount_continuity(field, x1, x2, device, n=512):
     return out
 
 
-def full_report(field, x1, x2, device, power_scale=1.0):
-    rep = dict(energy=energy_report(field, device, power_scale),
+def full_report(field, x1, x2, device, power_scale=1.0,
+                right_bc=C.RIGHT_BC):
+    rep = dict(energy=energy_report(field, device, power_scale,
+                                    right_bc=right_bc),
                T_max_K=device_Tmax(field, x1, x2, device),
-               aerogel=aerogel_check(field, device),
+               aerogel=aerogel_check(field, device, right_bc=right_bc),
                mount=mount_continuity(field, x1, x2, device))
     rep["T_max_C"] = {k: v - 273.15 for k, v in rep["T_max_K"].items()}
-    rep["feasible_70C"] = all(v <= C.T_LIM for v in rep["T_max_K"].values())
+    rep["constraints"] = {
+        "dev1_below_70C": rep["T_max_K"]["dev1"] <= C.T_LIM,
+        "dev2_below_70C": rep["T_max_K"]["dev2"] <= C.T_LIM,
+    }
+    rep["feasible_dev12_70C"] = all(rep["constraints"].values())
+    rep["objective_Tmax3_K"] = rep["T_max_K"]["dev3"]
+    rep["objective_Tmax3_C"] = rep["T_max_C"]["dev3"]
     return rep

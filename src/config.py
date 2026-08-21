@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Milestone 1 configuration: physical parameters, normalization, layouts.
+Milestone 1 configuration for the v4 benchmark.
 
 Implements the benchmark of docs/04_复现方案.md:
 closed low-pressure cavity, left aerogel layer, aluminum wall frame,
@@ -11,39 +11,43 @@ multi-material conduction only (no buoyancy, no radiation).
 Normalization (doc section 4):
     L_ref = 1 m,  theta = (T - 218.15 K) / 85 K
     theta_cold = 0,  theta_inf = 1,  theta_lim = 1.4706
-    Bi = h_ext L_ref / k_Al = 0.0898
+    right boundary = theta_inf = 1 (Dirichlet baseline)
+    Bi = h_ext L_ref / k_Al = 0.1198 (optional Robin variant)
 Per-domain equations are divided by the domain's own conductivity, so
 conductivity ratios only enter the interface flux-continuity losses.
 """
 import math
 
+# ---------------------------------------------------------------- case
+CASE_VERSION = "v4"
+
 # ---------------------------------------------------------------- geometry [m]
-X_TBL = -0.01           # aerogel outer face (cold side)
-W_IN = 0.05             # wall frame thickness / cavity inner offset
+X_TBL = -0.005          # aerogel outer face (cold side)
+W_IN = 0.01             # wall frame thickness / cavity inner offset
 D1, D2 = 0.2, 0.35      # device 1 / 2 side lengths
 C3 = (0.5, 0.4)         # device 3 (fixed disk) center
 R3 = 0.1
 B = 1.0                 # extrusion thickness
-X1_RANGE = (0.16, 0.84)     # feasible ranges (doc 1.3)
-X2_RANGE = (0.235, 0.765)
+X1_RANGE = (0.12, 0.88)     # feasible ranges (doc 1.3)
+X2_RANGE = (0.195, 0.805)
 
 # device bounds helpers (y-ranges are fixed)
-DEV1_Y = (W_IN, W_IN + D1)              # [0.05, 0.25]
-DEV2_Y = (1.0 - W_IN - D2, 1.0 - W_IN)  # [0.60, 0.95]
+DEV1_Y = (W_IN, W_IN + D1)              # [0.01, 0.21]
+DEV2_Y = (1.0 - W_IN - D2, 1.0 - W_IN)  # [0.64, 0.99]
 
 # ---------------------------------------------------------------- heat power
-P1, P2, P3 = 300.0, 600.0, 20.0         # W
-P_TOT = P1 + P2 + P3                    # 920 W
-Q1 = P1 / (D1 ** 2 * B)                 # 7500  W/m^3
-Q2 = P2 / (D2 ** 2 * B)                 # 4898  W/m^3
-Q3 = P3 / (math.pi * R3 ** 2 * B)       # 4775  W/m^3
+P1, P2, P3 = 270.0, 540.0, 20.0         # W
+P_TOT = P1 + P2 + P3                    # 830 W
+Q1 = P1 / (D1 ** 2 * B)                 # 6750 W/m^3
+Q2 = P2 / (D2 ** 2 * B)                 # 4408 W/m^3
+Q3 = P3 / (math.pi * R3 ** 2 * B)       # 637 W/m^3
 
 # ---------------------------------------------------------------- materials
 K_AL = 167.0        # devices + wall
 K_F = 0.026         # stagnant air
 K_TBL = 0.018       # aerogel
 
-# Milestone-1 choice: the 5 mm aerogel layer is EXACTLY degenerated to its
+# Milestone-1 choice: the 5 mm aerogel layer is degenerated to its
 # 1-D thermal resistance (doc 04 section 6: "verify the aerogel layer can
 # degenerate to a 1-D resistance"; the FEM reference with an explicit layer
 # confirms the 1-D model to 7e-4).  It enters the PINN as a Robin condition
@@ -51,14 +55,15 @@ K_TBL = 0.018       # aerogel
 # h_TBL = k_TBL / l_TBL.  Set USE_TBL_1D = False to resolve the layer as a
 # separate domain instead (kept for comparison).
 USE_TBL_1D = True
-L_TBL = abs(X_TBL)                  # 0.01 m
-H_TBL = K_TBL / L_TBL               # 1.8 W/m^2/K
-RPP_TBL = L_TBL / K_TBL             # 0.556 m^2 K/W
+L_TBL = abs(X_TBL)                  # 0.005 m
+H_TBL = K_TBL / L_TBL               # 3.6 W/m^2/K
+RPP_TBL = L_TBL / K_TBL             # 0.278 m^2 K/W
 
 # ---------------------------------------------------------------- environment
 T_COLD = 218.15     # left Dirichlet [K]  (-55 C)
-T_INF = 303.15      # right Robin ambient [K] (30 C)
-H_EXT = 20.0        # W/(m^2 K)
+T_INF = 303.15      # right heat-sink / Robin ambient [K] (30 C)
+RIGHT_BC = "dirichlet"  # v4 baseline; "robin" is the comparison variant
+H_EXT = 20.0        # W/(m^2 K), only used by the Robin variant
 T_LIM = 343.15      # device limit [K] (70 C)
 
 # ---------------------------------------------------------------- normalization
@@ -68,12 +73,12 @@ DT = 85.0
 THETA_COLD = 0.0
 THETA_INF = 1.0
 THETA_LIM = (T_LIM - T_C) / DT          # 1.4706
-BI = H_EXT * L_REF / K_AL               # 0.0898 (right Robin)
-BI_TBL = H_TBL * L_REF / K_AL           # 0.01078 (left aerogel Robin)
-S1 = Q1 * L_REF ** 2 / (K_AL * DT)      # 0.528
-S2 = Q2 * L_REF ** 2 / (K_AL * DT)      # 0.345
-S3 = Q3 * L_REF ** 2 / (K_AL * DT)      # 0.336
-Q_REF = 500.0       # characteristic boundary flux [W/m^2] ~ P_TOT/(2 m^2)
+BI = H_EXT * L_REF / K_AL               # 0.1198 (optional right Robin)
+BI_TBL = H_TBL * L_REF / K_AL           # 0.02156 (left aerogel Robin)
+S1 = Q1 * L_REF ** 2 / (K_AL * DT)      # 0.476
+S2 = Q2 * L_REF ** 2 / (K_AL * DT)      # 0.311
+S3 = Q3 * L_REF ** 2 / (K_AL * DT)      # 0.0449
+Q_REF = 500.0       # characteristic boundary flux [W/m^2]
 Q_IF = 150.0        # characteristic interface flux [W/m^2].  Smaller Q_IF
                     # stiffens flux continuity but creates a loss barrier:
                     # the device paraboloid (gain ~ w_dev*(S*p)^2*N_pts)

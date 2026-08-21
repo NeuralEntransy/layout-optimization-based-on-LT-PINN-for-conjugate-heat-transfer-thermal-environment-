@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Milestone 1 validation against the milestone-0 FEM reference.
+Milestone 1 v4 validation against the milestone-0 FEM reference.
 
 Checks (doc 04, sections 6 and 7.2):
   1. mounting-interface temperature / flux continuity (PINN soft losses)
   2. aerogel layer degenerates to the 1D thermal-resistance result
   3. total energy balance  |P_in - Q_left - Q_right| / P_in
   4. pointwise agreement with the FEM temperature field (per-domain rel-L2)
-  5. per-device T_max: PINN vs FEM
+  5. per-device T_max: PINN vs FEM; dev1/dev2 are constraints and dev3 is
+     the optimization objective
 
 Usage:
     python src/validate.py --layout center
@@ -37,6 +38,8 @@ def parse_args():
     p.add_argument("--fem", default=None)
     p.add_argument("--outdir", default=None)
     p.add_argument("--power-scale", type=float, default=1.0)
+    p.add_argument("--right-bc", choices=["dirichlet", "robin"],
+                   default=C.RIGHT_BC)
     p.add_argument("--device", default="auto")
     return p.parse_args()
 
@@ -48,12 +51,14 @@ def main():
         else args.device if args.device != "auto" else "cpu")
 
     x1, x2 = C.LAYOUTS[args.layout]
-    tag = args.layout + (f"_ps{args.power_scale:g}"
-                         if args.power_scale != 1.0 else "")
+    tag = f"{args.layout}_{C.CASE_VERSION}_{args.right_bc}"
+    if args.power_scale != 1.0:
+        tag += f"_ps{args.power_scale:g}"
     ckpt = args.ckpt or os.path.join(ROOT, "checkpoint_m1", tag, "latest.pt")
     suffix = args.layout + (f"_ps{args.power_scale:g}"
                             if args.power_scale != 1.0 else "")
-    fem_csv = args.fem or os.path.join(ROOT, "results", "milestone0_v2",
+    fem_case_dir = f"milestone0_{C.CASE_VERSION}_{args.right_bc}"
+    fem_csv = args.fem or os.path.join(ROOT, "results", fem_case_dir,
                                        f"Tfield_{suffix}.csv")
     fem_dir = os.path.dirname(os.path.abspath(fem_csv))
     fem_json = os.path.join(fem_dir, f"summary_{suffix}.json")
@@ -61,6 +66,16 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     ck = torch.load(ckpt, map_location=device, weights_only=False)
+    ck_case = ck.get("case")
+    ck_right_bc = ck.get("right_bc", ck.get("args", {}).get("right_bc"))
+    if ck_case != C.CASE_VERSION:
+        raise ValueError(
+            f"checkpoint case is {ck_case!r}, expected {C.CASE_VERSION!r}; "
+            "retrain with the v4 configuration")
+    if ck_right_bc != args.right_bc:
+        raise ValueError(
+            f"checkpoint right_bc is {ck_right_bc!r}, "
+            f"but validation requested {args.right_bc!r}")
     field = TemperatureField(ck["args"]["width"], ck["args"]["depth"],
                              fourier_sigma=ck["args"].get("fourier_sigma"),
                              fourier_dim=ck["args"].get("fourier_dim", 64)
@@ -117,9 +132,14 @@ def main():
                       max_abs_K=float(np.abs(e_all).max()))
 
     # ---------------------------------------------------------- PINN metrics
-    rep_pinn = M.full_report(field, x1, x2, device, args.power_scale)
+    rep_pinn = M.full_report(field, x1, x2, device, args.power_scale,
+                             right_bc=args.right_bc)
     with open(fem_json) as f:
         rep_fem = json.load(f)
+    if rep_fem.get("right_bc") != args.right_bc:
+        raise ValueError(
+            f"FEM reference right_bc is {rep_fem.get('right_bc')!r}, "
+            f"but validation requested {args.right_bc!r}")
 
     dev_cmp = {}
     for dom in ("dev1", "dev2", "dev3"):
@@ -129,7 +149,8 @@ def main():
             diff_K=rep_pinn["T_max_K"][dom] - rep_fem["T_max_K"][dom])
 
     result = dict(
-        layout=args.layout, x1=x1, x2=x2, power_scale=args.power_scale,
+        layout=args.layout, case=C.CASE_VERSION, right_bc=args.right_bc,
+        x1=x1, x2=x2, power_scale=args.power_scale,
         ckpt=ckpt, ckpt_epoch=ck["epoch"],
         pinn=rep_pinn,
         fem_energy=dict(Q_left=rep_fem["Q_left_W"],
@@ -142,7 +163,13 @@ def main():
             energy_balance_lt_1pc=
             rep_pinn["energy"]["balance_err"] < 0.01,
             aerogel_1D_rel_err=rep_pinn["aerogel"]["rel_err"],
-            all_below_70C=rep_pinn["feasible_70C"],
+            dev1_below_70C=rep_pinn["constraints"]["dev1_below_70C"],
+            dev2_below_70C=rep_pinn["constraints"]["dev2_below_70C"],
+            dev12_constraints_satisfied=rep_pinn["feasible_dev12_70C"],
+            objective_Tmax3_C=rep_pinn["objective_Tmax3_C"],
+            right_dirichlet_rms_err_K=
+            rep_pinn["energy"]["right_T_rms_err_K"]
+            if args.right_bc == "dirichlet" else None,
         ))
     with open(os.path.join(outdir, "validation.json"), "w") as f:
         json.dump(result, f, indent=2)
@@ -175,8 +202,8 @@ def main():
     axes[2].axhline(70, color="r", ls=":", label="70 °C limit")
     axes[2].set_xticks(xp, doms); axes[2].set_ylabel("T_max [°C]")
     axes[2].set_title("device T_max"); axes[2].legend(); axes[2].grid(alpha=.3)
-    fig.suptitle(f"milestone 1 validation — layout {args.layout} "
-                 f"(x1={x1}, x2={x2})")
+    fig.suptitle(f"milestone 1 v4 validation — layout {args.layout} "
+                 f"(right={args.right_bc}, x1={x1}, x2={x2})")
     fig.tight_layout()
     fig_path = os.path.join(outdir, f"validation_{tag}.png")
     fig.savefig(fig_path, dpi=150)

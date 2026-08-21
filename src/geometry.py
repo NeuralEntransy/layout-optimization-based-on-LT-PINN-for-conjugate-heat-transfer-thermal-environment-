@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Geometry for the closed-cavity thermal layout benchmark (doc 04, section 1,
-v3 parameters: 1 cm aerogel, 5 cm wall frame, cavity [0.05, 0.95]^2,
+v4 parameters: 5 mm aerogel, 1 cm wall frame, cavity [0.01, 0.99]^2,
 disk device 20 W).
 
 Domains (physical coordinates [m]):
-    tbl    : aerogel layer  [-0.01, 0] x [0, 1]   (only when not USE_TBL_1D)
+    tbl    : aerogel layer  [-0.005, 0] x [0, 1]  (only when not USE_TBL_1D)
     wall_* : aluminum frame split into four strips:
-             wall_l [0, 0.05]x[0, 1]        wall_r [0.95, 1]x[0, 1]
-             wall_b [0.05, 0.95]x[0, 0.05]  wall_t [0.05, 0.95]x[0.95, 1]
-    air    : cavity         [0.05, 0.95]^2 minus the three devices
-    dev1   : square  [x1-0.1, x1+0.1] x [0.05, 0.25]     (bottom wall mount)
-    dev2   : square  [x2-0.175, x2+0.175] x [0.60, 0.95] (top wall mount)
+             wall_l [0, 0.01]x[0, 1]        wall_r [0.99, 1]x[0, 1]
+             wall_b [0.01, 0.99]x[0, 0.01]  wall_t [0.01, 0.99]x[0.99, 1]
+    air    : cavity         [0.01, 0.99]^2 minus the three devices
+    dev1   : square  [x1-0.1, x1+0.1] x [0.01, 0.21]     (bottom wall mount)
+    dev2   : square  [x2-0.175, x2+0.175] x [0.64, 0.99] (top wall mount)
     dev3   : disk    center (0.5, 0.4), R = 0.1          (fixed)
 
 The wall frame is split because a single frame network puts the thin strips
@@ -28,7 +28,7 @@ Provides:
   * interface samplers returning points + fixed global direction e_xi
     (flux continuity: k_a dtheta_a/dxi = k_b dtheta_b/dxi)
   * outer-boundary samplers (left Robin via 1-D aerogel resistance /
-    right Robin / top+bottom adiabatic)
+    right Dirichlet baseline (or Robin variant) / top+bottom adiabatic)
 """
 import math
 import torch
@@ -70,7 +70,7 @@ _INTERFACES_ALL = [
     ("dev2_air_bottom", "dev2",   "air"),
     ("dev3_air",        "dev3",   "air"),
     # frame corner joints: the four wall strips share edges at the corners
-    # (x=0.05/0.95, y in the strip thickness) and must be thermally
+    # (x=0.01/0.99, y in the strip thickness) and must be thermally
     # continuous so heat can flow around the frame
     ("corner_l_b",      "wall_l", "wall_b"),
     ("corner_l_t",      "wall_l", "wall_t"),

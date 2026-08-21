@@ -4,11 +4,12 @@ Milestone 1: solid thermal bridges + pure multi-material conduction
 ====================================================================
 Reproduction plan: docs/04_复现方案.md, section 6 (Milestone 1).
 
-Physics: steady conduction in 6 subdomains (aerogel / Al wall frame /
-stagnant cavity air / 3 devices with volumetric heat sources).
-Buoyancy and radiation are switched OFF. Interfaces impose temperature +
-flux continuity; outer BCs: left Dirichlet 218.15 K, top/bottom adiabatic,
-right Robin (h = 15 W/m^2/K, T_inf = 303.15 K).
+Physics: steady multi-domain conduction in the aluminum wall frame, stagnant
+cavity air and three devices with volumetric heat sources.  The 5 mm aerogel
+is represented by its one-dimensional resistance by default.  Buoyancy and
+radiation are switched OFF.  Interfaces impose temperature + flux continuity;
+outer BCs are left aerogel resistance, top/bottom adiabatic and the v4 right
+30 C Dirichlet heat sink (an optional Robin comparison is retained).
 
 The two design variables x1/x2 are created through the sigmoid
 parameterization of geometry.DesignVars but are FROZEN in milestone 1
@@ -65,6 +66,9 @@ def parse_args():
     p.add_argument("--depth", type=int, default=C.TRAIN["depth"])
     p.add_argument("--power-scale", type=float, default=1.0,
                    help="final heat-source scale")
+    p.add_argument("--right-bc", choices=["dirichlet", "robin"],
+                   default=C.RIGHT_BC,
+                   help="right boundary: v4 ideal heat sink or comparison")
     p.add_argument("--power-start", type=float, default=None,
                    help="ramp start scale (default: = power-scale, no ramp)")
     p.add_argument("--ramp", choices=["none", "linear", "exp"],
@@ -115,7 +119,9 @@ def main():
     x1_0 = args.x1 if args.x1 is not None else x1_0
     x2_0 = args.x2 if args.x2 is not None else x2_0
 
-    tag = args.layout if (args.x1 is None and args.x2 is None) else "custom"
+    layout_tag = args.layout if (args.x1 is None and args.x2 is None) \
+        else "custom"
+    tag = f"{layout_tag}_{C.CASE_VERSION}_{args.right_bc}"
     if args.power_scale != 1.0:
         tag += f"_ps{args.power_scale:g}"
     ckptdir = args.ckptdir or os.path.join(DEFAULT_CKPT_ROOT, tag)
@@ -135,7 +141,7 @@ def main():
     condLoss = ConductionLoss(field, power_scale=args.power_scale,
                               w_dev=args.w_pde_dev)
     ifaceLoss = InterfaceLoss(field)
-    bcLoss = BoundaryLoss(field)
+    bcLoss = BoundaryLoss(field, right_bc=args.right_bc)
     engLoss = EnergyBudgetLoss(field)
 
     net_params = [p for n, p in field.named_parameters()
@@ -167,13 +173,16 @@ def main():
         print("[fresh] training from scratch "
               "(old 3.1.2 checkpoints are never loaded)")
 
-    print(f"layout={tag}  x1={float(x1):.4f}  x2={float(x2):.4f}  "
-          f"device={device}  power_scale={args.power_scale}")
+    print(f"layout={layout_tag}  case={C.CASE_VERSION}  "
+          f"right_bc={args.right_bc}  x1={float(x1):.4f}  "
+          f"x2={float(x2):.4f}  device={device}  "
+          f"power_scale={args.power_scale}")
     print(f"ckptdir={ckptdir}\noutdir={outdir}")
 
     log_path = os.path.join(ckptdir, "loss_log.csv")
     log_header = ["epoch", "loss", "pde", "if_T", "if_q", "bc", "eng",
-                  "Q_left", "Q_right", "Q_robin", "balance_err",
+                  "Q_left", "Q_right", "Q_right_robin",
+                  "right_T_rms_err_K", "balance_err",
                   "Tmax1_C", "Tmax2_C", "Tmax3_C", "lr", "sec"]
     if start_epoch == 1 or not os.path.exists(log_path):
         with open(log_path, "w", newline="") as f:
@@ -228,12 +237,13 @@ def main():
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             ps_now = condLoss.power_scale
-            flux = M.energy_report(field, device, ps_now, n=257)
+            flux = M.energy_report(field, device, ps_now, n=257,
+                                   right_bc=args.right_bc)
             tmax = M.device_Tmax(field, float(x1), float(x2), device, n=41)
             row = [epoch, float(loss), float(l_pde), float(l_ifT),
                    float(l_ifq), float(l_bc), float(l_eng),
                    flux["Q_left"], flux["Q_right"], flux["Q_right_robin"],
-                   flux["balance_err"],
+                   flux["right_T_rms_err_K"], flux["balance_err"],
                    tmax["dev1"] - 273.15, tmax["dev2"] - 273.15,
                    tmax["dev3"] - 273.15,
                    scheduler.get_last_lr()[0], time.time() - t0]
@@ -252,6 +262,8 @@ def main():
             torch.save(dict(field=field.state_dict(),
                             optimizer=optimizer.state_dict(),
                             scheduler=scheduler.state_dict(),
+                            case=C.CASE_VERSION,
+                            right_bc=args.right_bc,
                             design=dict(z1=float(design.z1),
                                         z2=float(design.z2)),
                             epoch=epoch, args=vars(args)), ckpt_path)
@@ -291,14 +303,15 @@ def main():
             if step % 10 == 0 or step == args.lbfgs_steps:
                 _, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(*fixed)
                 flux = M.energy_report(field, device, args.power_scale,
-                                       n=257)
+                                       n=257, right_bc=args.right_bc)
                 tmax = M.device_Tmax(field, float(x1), float(x2), device,
                                      n=41)
                 epoch_tag = args.epochs + step
                 row = [epoch_tag, float(l_val), float(l_pde), float(l_ifT),
                        float(l_ifq), float(l_bc), float(l_eng),
                        flux["Q_left"], flux["Q_right"],
-                       flux["Q_right_robin"], flux["balance_err"],
+                       flux["Q_right_robin"],
+                       flux["right_T_rms_err_K"], flux["balance_err"],
                        tmax["dev1"] - 273.15, tmax["dev2"] - 273.15,
                        tmax["dev3"] - 273.15, -1.0, time.time() - t0]
                 with open(log_path, "a", newline="") as f:
@@ -317,6 +330,8 @@ def main():
                 torch.save(dict(field=field.state_dict(),
                                 optimizer=optimizer.state_dict(),
                                 scheduler=scheduler.state_dict(),
+                                case=C.CASE_VERSION,
+                                right_bc=args.right_bc,
                                 design=dict(z1=float(design.z1),
                                             z2=float(design.z2)),
                                 epoch=args.epochs + step,
@@ -325,8 +340,10 @@ def main():
     # ------------------------------------------------------------ final report
     condLoss.power_scale = args.power_scale       # ensure full-power metrics
     report = M.full_report(field, float(x1), float(x2), device,
-                           args.power_scale)
-    report.update(dict(layout=tag, x1=float(x1), x2=float(x2),
+                           args.power_scale, right_bc=args.right_bc)
+    report.update(dict(layout=layout_tag, case=C.CASE_VERSION,
+                       right_bc=args.right_bc,
+                       x1=float(x1), x2=float(x2),
                        power_scale=args.power_scale, epochs=args.epochs,
                        wall_time_min=(time.time() - t_start) / 60))
     with open(os.path.join(outdir, "final_report.json"), "w") as f:
@@ -334,7 +351,8 @@ def main():
     print("\n=== final report ===")
     print(json.dumps(report, indent=2))
     print(f"\ncheckpoint: {ckpt_path}\nreport: {outdir}/final_report.json")
-    print("next: python src/validate.py --layout", args.layout)
+    print("next: python src/validate.py --layout", args.layout,
+          "--right-bc", args.right_bc)
 
 
 if __name__ == "__main__":

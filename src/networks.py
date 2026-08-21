@@ -19,19 +19,22 @@ FlowNet (u, v, p) without touching the temperature branch structure.
 import torch
 import torch.nn as nn
 
+import config as C
 import geometry as G
 
 # fixed input affine transforms: z = (x - center) / scale
 _INPUT_NORM = dict(
-    tbl=((-0.005, 0.5), (0.005, 0.5)),
-    wall_l=((0.025, 0.5), (0.025, 0.5)),
-    wall_r=((0.975, 0.5), (0.025, 0.5)),
-    wall_b=((0.5, 0.025), (0.45, 0.025)),
-    wall_t=((0.5, 0.975), (0.45, 0.025)),
-    air=((0.5, 0.5), (0.45, 0.45)),
-    dev1=((0.5, 0.15), (0.5, 0.10)),
-    dev2=((0.5, 0.775), (0.5, 0.175)),
-    dev3=((0.5, 0.4), (0.5, 0.10)),
+    tbl=((C.X_TBL / 2, 0.5), (C.L_TBL / 2, 0.5)),
+    wall_l=((C.W_IN / 2, 0.5), (C.W_IN / 2, 0.5)),
+    wall_r=((1 - C.W_IN / 2, 0.5), (C.W_IN / 2, 0.5)),
+    wall_b=((0.5, C.W_IN / 2), ((1 - 2 * C.W_IN) / 2, C.W_IN / 2)),
+    wall_t=((0.5, 1 - C.W_IN / 2),
+            ((1 - 2 * C.W_IN) / 2, C.W_IN / 2)),
+    air=((0.5, 0.5), ((1 - 2 * C.W_IN) / 2,
+                      (1 - 2 * C.W_IN) / 2)),
+    dev1=((0.5, C.W_IN + C.D1 / 2), (0.5, C.D1 / 2)),
+    dev2=((0.5, 1 - C.W_IN - C.D2 / 2), (0.5, C.D2 / 2)),
+    dev3=(C.C3, (0.5, C.R3)),
 )
 
 # Per-domain output scales: theta = out_scale * net(z).  The stagnant-air
