@@ -20,6 +20,10 @@ import math
 
 # ---------------------------------------------------------------- case
 CASE_VERSION = "v4"
+# Checkpoints with a different loss version may still provide compatible
+# TemperatureField weights, but their optimizer/L-BFGS state must not be
+# resumed because the objective and its gradient scales have changed.
+LOSS_VERSION = "m1_energy_v2"
 
 # ---------------------------------------------------------------- geometry [m]
 X_TBL = -0.005          # aerogel outer face (cold side)
@@ -113,19 +117,21 @@ LAYOUTS = dict(left=(0.25, 0.35), center=(0.50, 0.50), right=(0.75, 0.65))
 
 # ---------------------------------------------------------------- training defaults
 TRAIN = dict(
-    epochs=30000,
-    lr=1e-3,
+    # Energy-recovery stage A: intended for field-only warm start from the
+    # existing 60k solution. The network shape itself is unchanged.
+    epochs=5000,
+    lr=1e-5,
     width=96, depth=5,
     # recommended full-power continuation
     power_scale=1.0,
-    power_start=0.1,
-    ramp="exp",
-    ramp_frac=0.8,
+    power_start=1.0,
+    ramp="none",
+    ramp_frac=1.0,
     # optional quasi-Newton polish after Adam
-    lbfgs_steps=200,
+    lbfgs_steps=0,
     lbfgs_max_iter=20,
     lbfgs_history=50,
-    lbfgs_resample=100,
+    lbfgs_resample=0,
     # feature mapping / field initialization
     fourier_sigma=None,       # None = use per-domain values in networks.py
     fourier_dim=64,
@@ -138,11 +144,22 @@ TRAIN = dict(
     n_dom=dict(tbl=1500, wall_l=1000, wall_r=1000, wall_b=1500, wall_t=1500,
                air=6000, dev1=1200, dev2=1500, dev3=1200),
     n_iface=256, n_bnd=256,
+    # Fixed midpoint quadrature used only by integral energy constraints.
+    # Keeping it separate from random collocation removes Monte-Carlo target
+    # noise without changing the neural-network architecture.
+    n_energy=512,
     # loss weights
-    w_pde=1.0, w_if_T=10.0, w_if_q=10.0, w_bc=20.0,
-    w_pde_dev=100.0,   # extra weight on the device Poisson residual
-    w_eng=30.0,        # per-device / global energy-budget residuals: direct
-                       # drive for the correct heat-export amplitudes
+    w_pde=1.0, w_if_T=10.0, w_if_q=10.0, w_bc=50.0,
+    w_pde_dev=400.0,   # explicit device-Poisson emphasis; residual scale=1
+    w_eng=100.0,
+    # Inner energy-budget weights. Stage A emphasizes device power recovery
+    # while introducing the new wall balances conservatively. They can be
+    # raised independently without changing the outer w_eng scale.
+    eng_w_device=1.0,
+    eng_w_air=1.0,
+    eng_w_wall=0.25,
+    eng_w_global=1.0,
+    eng_w_adiabatic=1.0,
     eval_every=100, save_every=1000,
     seed=20231028,
 )

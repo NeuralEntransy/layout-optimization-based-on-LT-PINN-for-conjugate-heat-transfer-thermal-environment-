@@ -36,6 +36,23 @@ def _flux_line(field, dom, pts, comp, k, sign, device):
     return float(q_n.mean() * 1.0 * C.B), th.detach()
 
 
+def _horizontal_flux_segment(field, dom, x0, x1, y, n, sign, device):
+    """Integrate one material network over its actual horizontal span.
+
+    ``_flux_line`` returns the mean flux multiplied by a unit line length.
+    Here the point count is allocated in proportion to the segment length and
+    the result is multiplied by that physical length.  This avoids evaluating
+    ``wall_t``/``wall_b`` outside their domains over the two corner strips.
+    """
+    length = abs(x1 - x0)
+    # Match approximately the point density of an n-point, one-metre line.
+    n_segment = max(2, int(round((n - 1) * length)) + 1)
+    q_per_unit, th = _flux_line(
+        field, dom, _line2(x0, x1, y, n_segment, device),
+        1, C.K_OF_DOMAIN[dom], sign=sign, device=device)
+    return q_per_unit * length, th
+
+
 @torch.no_grad()
 def device_Tmax(field, x1, x2, device, n=81):
     """Dense per-device max temperature [K]."""
@@ -83,11 +100,27 @@ def boundary_fluxes(field, device, n=1025, right_bc=C.RIGHT_BC):
         Q_left_robin = Q_left
     Q_right, th_r = _flux_line(field, "wall_r", _line(1.0, 0, 1, n, device),
                                0, C.K_AL, sign=+1.0, device=device)
-    # top/bottom outer edges
-    Q_top, _ = _flux_line(field, "wall_t", _line2(0, 1, 1.0, n, device),
-                          1, C.K_AL, sign=+1.0, device=device)
-    Q_bottom, _ = _flux_line(field, "wall_b", _line2(0, 1, 0.0, n, device),
-                             1, C.K_AL, sign=-1.0, device=device)
+    # The top/bottom edges are three distinct network domains.  In particular,
+    # wall_t/wall_b only cover x in [W_IN, 1-W_IN]; using either one over the
+    # full width extrapolates it through the two wall-corner strips.
+    top_segments = (
+        ("wall_l", 0.0, C.W_IN),
+        ("wall_t", C.W_IN, 1.0 - C.W_IN),
+        ("wall_r", 1.0 - C.W_IN, 1.0),
+    )
+    bottom_segments = (
+        ("wall_l", 0.0, C.W_IN),
+        ("wall_b", C.W_IN, 1.0 - C.W_IN),
+        ("wall_r", 1.0 - C.W_IN, 1.0),
+    )
+    Q_top = sum(
+        _horizontal_flux_segment(field, dom, x0, x1_, 1.0, n, +1.0,
+                                 device)[0]
+        for dom, x0, x1_ in top_segments)
+    Q_bottom = sum(
+        _horizontal_flux_segment(field, dom, x0, x1_, 0.0, n, -1.0,
+                                 device)[0]
+        for dom, x0, x1_ in bottom_segments)
     if not C.USE_TBL_1D:
         q_tbl_t, _ = _flux_line(field, "tbl",
                                 _line2(C.X_TBL, 0, 1.0, 65, device),
@@ -123,7 +156,14 @@ def energy_report(field, device, power_scale=1.0, n=1025,
     fl = boundary_fluxes(field, device, n, right_bc)
     P = C.P_TOT * power_scale
     fl["P_in"] = P
-    fl["balance_err"] = abs(P - fl["Q_left"] - fl["Q_right"]) / P
+    fl["Q_outer"] = (fl["Q_left"] + fl["Q_right"]
+                     + fl["Q_top"] + fl["Q_bottom"])
+    # Keep the old left/right-only diagnostic because QL/QR are important
+    # engineering outputs.  The actual global conservation check, however,
+    # must include all four outer sides while top/bottom are still imperfect.
+    fl["balance_lr_err"] = abs(
+        P - fl["Q_left"] - fl["Q_right"]) / P
+    fl["balance_err"] = abs(P - fl["Q_outer"]) / P
     fl["adiabatic_leak"] = abs(fl["Q_top"]) + abs(fl["Q_bottom"])
     return fl
 

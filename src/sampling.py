@@ -35,6 +35,29 @@ def _vertical_line(n, x, y_range, device):
     return p
 
 
+def _line_midpoints(n, start, end, device):
+    """Deterministic equal-weight midpoint rule on a straight segment."""
+    u = (torch.arange(n, device=device, dtype=torch.float32) + 0.5) / n
+    start = torch.tensor(start, device=device, dtype=torch.float32)
+    end = torch.tensor(end, device=device, dtype=torch.float32)
+    return start + u[:, None] * (end - start)
+
+
+def _union_midpoints(n, segments, y, device):
+    """Deterministic midpoint rule on a length-parameterized segment union."""
+    lengths = torch.tensor([b - a for a, b in segments], device=device)
+    cumulative = torch.cumsum(lengths, 0)
+    u = (torch.arange(n, device=device, dtype=torch.float32) + 0.5) \
+        / n * cumulative[-1]
+    x = torch.empty_like(u)
+    for i, (a, _b) in enumerate(segments):
+        lower = cumulative[i] - lengths[i]
+        mask = (u >= lower) & (u < cumulative[i]) \
+            if i < len(segments) - 1 else (u >= lower)
+        x[mask] = a + (u[mask] - lower)
+    return torch.stack([x, torch.full_like(x, y)], dim=1)
+
+
 def _union_segment(n, segments, y, device):
     """Length-weighted uniform samples on a union of horizontal segments."""
     lengths = torch.tensor([b - a for a, b in segments], device=device)
@@ -88,107 +111,119 @@ def sample_domain(name, n, x1, x2, device):
     raise KeyError(name)
 
 
-def sample_interface(name, n, x1, x2, device):
+def sample_interface(name, n, x1, x2, device, deterministic=False):
     """Return interface points and a shared unit derivative direction."""
     x1f, x2f = float(x1), float(x2)
     wall = C.W_IN
+    vline = (lambda x, yr: _line_midpoints(
+        n, (x, yr[0]), (x, yr[1]), device)) if deterministic else \
+        (lambda x, yr: _vertical_line(n, x, yr, device))
+    hline = (lambda xr, y: _line_midpoints(
+        n, (xr[0], y), (xr[1], y), device)) if deterministic else \
+        (lambda xr, y: _box(n, xr[0], xr[1], y, y, device))
+    union = _union_midpoints if deterministic else _union_segment
+
     if name == "tbl_wall":
-        points = _vertical_line(n, 0.0, (0.0, 1.0), device)
+        points = vline(0.0, (0.0, 1.0))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "wall_air_left":
-        points = _vertical_line(n, wall, (wall, 1 - wall), device)
+        points = vline(wall, (wall, 1 - wall))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "wall_air_right":
-        points = _vertical_line(n, 1 - wall, (wall, 1 - wall), device)
+        points = vline(1 - wall, (wall, 1 - wall))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "wall_air_bottom":
         segments = [(wall, x1f - C.D1 / 2),
                     (x1f + C.D1 / 2, 1 - wall)]
-        points = _union_segment(n, segments, wall, device)
+        points = union(n, segments, wall, device)
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "wall_air_top":
         segments = [(wall, x2f - C.D2 / 2),
                     (x2f + C.D2 / 2, 1 - wall)]
-        points = _union_segment(n, segments, 1 - wall, device)
+        points = union(n, segments, 1 - wall, device)
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "dev1_wall":
-        points = _box(n, x1f - C.D1 / 2, x1f + C.D1 / 2,
-                      wall, wall, device)
+        points = hline((x1f - C.D1 / 2, x1f + C.D1 / 2), wall)
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "dev1_air_left":
-        points = _vertical_line(n, x1f - C.D1 / 2, C.DEV1_Y, device)
+        points = vline(x1f - C.D1 / 2, C.DEV1_Y)
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "dev1_air_right":
-        points = _vertical_line(n, x1f + C.D1 / 2, C.DEV1_Y, device)
+        points = vline(x1f + C.D1 / 2, C.DEV1_Y)
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "dev1_air_top":
-        points = _box(n, x1f - C.D1 / 2, x1f + C.D1 / 2,
-                      C.DEV1_Y[1], C.DEV1_Y[1], device)
+        points = hline((x1f - C.D1 / 2, x1f + C.D1 / 2), C.DEV1_Y[1])
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "dev2_wall":
-        points = _box(n, x2f - C.D2 / 2, x2f + C.D2 / 2,
-                      1 - wall, 1 - wall, device)
+        points = hline((x2f - C.D2 / 2, x2f + C.D2 / 2), 1 - wall)
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "dev2_air_left":
-        points = _vertical_line(n, x2f - C.D2 / 2, C.DEV2_Y, device)
+        points = vline(x2f - C.D2 / 2, C.DEV2_Y)
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "dev2_air_right":
-        points = _vertical_line(n, x2f + C.D2 / 2, C.DEV2_Y, device)
+        points = vline(x2f + C.D2 / 2, C.DEV2_Y)
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "dev2_air_bottom":
-        points = _box(n, x2f - C.D2 / 2, x2f + C.D2 / 2,
-                      C.DEV2_Y[0], C.DEV2_Y[0], device)
+        points = hline((x2f - C.D2 / 2, x2f + C.D2 / 2), C.DEV2_Y[0])
         directions = torch.tensor([0.0, 1.0], device=device).expand(n, 2)
     elif name == "dev3_air":
-        angle = 2 * math.pi * torch.rand(n, device=device)
+        angle = 2 * math.pi * ((torch.arange(n, device=device) + 0.5) / n \
+            if deterministic else torch.rand(n, device=device))
         points = torch.stack([C.C3[0] + C.R3 * torch.cos(angle),
                               C.C3[1] + C.R3 * torch.sin(angle)], dim=1)
         directions = torch.stack([torch.cos(angle), torch.sin(angle)], dim=1)
     elif name == "corner_l_b":
-        points = _vertical_line(n, wall, (0.0, wall), device)
+        points = vline(wall, (0.0, wall))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "corner_l_t":
-        points = _vertical_line(n, wall, (1 - wall, 1.0), device)
+        points = vline(wall, (1 - wall, 1.0))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "corner_r_b":
-        points = _vertical_line(n, 1 - wall, (0.0, wall), device)
+        points = vline(1 - wall, (0.0, wall))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     elif name == "corner_r_t":
-        points = _vertical_line(n, 1 - wall, (1 - wall, 1.0), device)
+        points = vline(1 - wall, (1 - wall, 1.0))
         directions = torch.tensor([1.0, 0.0], device=device).expand(n, 2)
     else:
         raise KeyError(name)
     return points, directions
 
 
-def sample_all_interfaces(n, x1, x2, device):
+def sample_all_interfaces(n, x1, x2, device, deterministic=False):
     """Sample every active interface and attach its topology metadata."""
     samples = {}
     for name, domain_a, domain_b in G.INTERFACES:
-        points, directions = sample_interface(name, n, x1, x2, device)
+        points, directions = sample_interface(
+            name, n, x1, x2, device, deterministic=deterministic)
         samples[name] = dict(pts=points, dirs=directions,
                              a=domain_a, b=domain_b)
     return samples
 
 
-def sample_boundaries(n, device):
+def sample_boundaries(n, device, deterministic=False):
     """Sample outer boundaries and identify the owning temperature branch."""
     boundaries = {}
+    vline = (lambda x, yr: _line_midpoints(
+        n, (x, yr[0]), (x, yr[1]), device)) if deterministic else \
+        (lambda x, yr: _vertical_line(n, x, yr, device))
+    hline = (lambda xr, y: _line_midpoints(
+        n, (xr[0], y), (xr[1], y), device)) if deterministic else \
+        (lambda xr, y: _box(n, xr[0], xr[1], y, y, device))
     if C.USE_TBL_1D:
         # Robin resistance from wall_l at x=0 to the cold reservoir.
         boundaries["left"] = dict(
-            pts=_vertical_line(n, 0.0, (0.0, 1.0), device), dom="wall_l")
+            pts=vline(0.0, (0.0, 1.0)), dom="wall_l")
     else:
         boundaries["left"] = dict(
-            pts=_vertical_line(n, C.X_TBL, (0.0, 1.0), device), dom="tbl")
+            pts=vline(C.X_TBL, (0.0, 1.0)), dom="tbl")
 
     boundaries["right"] = dict(
-        pts=_vertical_line(n, 1.0, (0.0, 1.0), device), dom="wall_r")
+        pts=vline(1.0, (0.0, 1.0)), dom="wall_r")
 
     if not C.USE_TBL_1D:
         for side, y in [("top", 1.0), ("bottom", 0.0)]:
             boundaries[f"{side}_tbl"] = dict(
-                pts=_box(n, C.X_TBL, 0.0, y, y, device), dom="tbl",
+                pts=hline((C.X_TBL, 0.0), y), dom="tbl",
                 dirs=torch.tensor([0.0, 1.0], device=device).expand(n, 2))
 
     # y=0/1 spans wall_l, wall_b/wall_t and wall_r.
@@ -199,6 +234,6 @@ def sample_boundaries(n, device):
                   ("wall_r", (1 - C.W_IN, 1.0))]
         for strip, (x0, x1_) in strips:
             boundaries[f"{side}_{strip}"] = dict(
-                pts=_box(n, x0, x1_, y, y, device), dom=strip,
+                pts=hline((x0, x1_), y), dom=strip,
                 dirs=torch.tensor([0.0, 1.0], device=device).expand(n, 2))
     return boundaries

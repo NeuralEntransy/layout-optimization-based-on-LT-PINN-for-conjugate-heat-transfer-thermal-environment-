@@ -16,12 +16,13 @@ parameterization of geometry.DesignVars but are FROZEN in milestone 1
 (fixed layout validation against the milestone-0 FEM reference).
 
 Usage (torch env):
-    python src/main.py --lr 1e-3 --epochs 30000 --layout center --device cuda:0
-    python src/main.py --layout center --power-scale 0.1 --epochs 2000  # debug
-    python src/main.py --layout center --resume                          # continue
+    python src/main.py --layout center --device cuda:0
+    python src/main.py --layout center --resume
+    python src/main.py --layout center --init-from OLD.pt --ckptdir NEW_DIR
 
 Outputs:
-    <ckptdir>/latest.pt, loss_log.csv, final_report.json
+    <ckptdir>/latest.pt, loss_log.csv, energy_log.csv, physics_log.csv
+    <outdir>/final_report.json
     <outdir>/  (shared with validate.py results)
 """
 import argparse
@@ -88,6 +89,21 @@ def parse_args():
     p.add_argument("--w-pde", type=float, default=C.TRAIN["w_pde"])
     p.add_argument("--w-pde-dev", type=float, default=C.TRAIN["w_pde_dev"])
     p.add_argument("--w-eng", type=float, default=C.TRAIN["w_eng"])
+    p.add_argument("--eng-w-device", type=float,
+                   default=C.TRAIN["eng_w_device"],
+                   help="inner weight of per-device double-sided budgets")
+    p.add_argument("--eng-w-air", type=float,
+                   default=C.TRAIN["eng_w_air"],
+                   help="inner weight of the source-free air balance")
+    p.add_argument("--eng-w-wall", type=float,
+                   default=C.TRAIN["eng_w_wall"],
+                   help="inner weight of source-free wall balances")
+    p.add_argument("--eng-w-global", type=float,
+                   default=C.TRAIN["eng_w_global"],
+                   help="inner weight of the four-side global balance")
+    p.add_argument("--eng-w-adiabatic", type=float,
+                   default=C.TRAIN["eng_w_adiabatic"],
+                   help="inner weight of integrated top/bottom leakage")
     p.add_argument("--w-if-T", type=float, default=C.TRAIN["w_if_T"])
     p.add_argument("--w-if-q", type=float, default=C.TRAIN["w_if_q"])
     p.add_argument("--w-bc", type=float, default=C.TRAIN["w_bc"])
@@ -105,10 +121,13 @@ def parse_args():
     p.add_argument("--device", default="auto")
     p.add_argument("--resume", action="store_true",
                    help="load <ckptdir>/latest.pt (default: fresh start)")
+    p.add_argument("--resume-from", default=None,
+                   help="checkpoint to resume instead of <ckptdir>/latest.pt; "
+                        "restores field, Adam, scheduler and epoch")
     p.add_argument("--resume-lr", type=float, default=None,
                    help="override the current Adam learning rate after "
                         "loading a resume checkpoint; keeps optimizer "
-                        "moments and scheduler progress")
+                        "moments and extends an exhausted cosine schedule")
     p.add_argument("--init-from", default=None,
                    help="warm-start field weights from another checkpoint "
                         "(fresh optimizer/scheduler; for power ramp stages)")
@@ -161,7 +180,13 @@ def main():
                               w_dev=args.w_pde_dev)
     ifaceLoss = InterfaceLoss(field)
     bcLoss = BoundaryLoss(field, right_bc=args.right_bc)
-    engLoss = EnergyConservationLoss(field)
+    engLoss = EnergyConservationLoss(
+        field,
+        w_device=args.eng_w_device,
+        w_air=args.eng_w_air,
+        w_wall=args.eng_w_wall,
+        w_global=args.eng_w_global,
+        w_adiabatic=args.eng_w_adiabatic)
 
     optimizer = torch.optim.Adam(field.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -188,13 +213,15 @@ def main():
         torch.save(state, history_path)
         torch.save(state, ckpt_path)
 
-    if args.resume and os.path.exists(ckpt_path):
-        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    resume_path = args.resume_from or ckpt_path
+    if args.resume and os.path.exists(resume_path):
+        ck = torch.load(resume_path, map_location=device, weights_only=False)
         field.load_state_dict(ck["field"])
         optimizer.load_state_dict(ck["optimizer"])
         scheduler.load_state_dict(ck["scheduler"])
         start_epoch = ck["epoch"] + 1
-        print(f"[resume] from {ckpt_path} @ epoch {ck['epoch']}")
+        print(f"[resume] from {resume_path} @ epoch {ck['epoch']} "
+              f"(phase={ck.get('phase', 'unknown')})")
         if args.resume_lr is not None:
             if args.resume_lr <= 0:
                 raise ValueError("--resume-lr must be positive")
@@ -204,8 +231,19 @@ def main():
             scheduler.base_lrs = [args.resume_lr] * len(optimizer.param_groups)
             scheduler.eta_min = args.resume_lr * 1e-2
             scheduler._last_lr = [args.resume_lr] * len(optimizer.param_groups)
-            print(f"[resume] learning rate overridden to "
-                  f"{args.resume_lr:g}; scheduler epoch retained")
+            old_t_max = scheduler.T_max
+            if scheduler.last_epoch >= old_t_max and args.epochs >= start_epoch:
+                remaining = args.epochs - ck["epoch"]
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=remaining,
+                    eta_min=args.resume_lr * 1e-2)
+                print(f"[resume] completed cosine schedule replaced by a "
+                      f"new {remaining}-epoch schedule")
+            else:
+                print("[resume] scheduler progress retained")
+            print(f"[resume] learning rate overridden to {args.resume_lr:g}")
+    elif args.resume:
+        raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
     elif args.init_from and os.path.exists(args.init_from):
         ck = torch.load(args.init_from, map_location=device,
                         weights_only=False)
@@ -223,6 +261,7 @@ def main():
     print(f"ckptdir={ckptdir}\noutdir={outdir}")
 
     log_path = os.path.join(ckptdir, "loss_log.csv")
+    energy_log_path = os.path.join(ckptdir, "energy_log.csv")
     log_header = ["epoch", "loss", "pde", "if_T", "if_q", "bc", "eng",
                   "Q_left", "Q_right", "Q_right_robin",
                   "right_T_rms_err_K", "balance_err",
@@ -231,20 +270,42 @@ def main():
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(log_header)
 
+    energy_header = ["epoch", "phase", "eng_dev1_recv", "eng_dev1_dev",
+                     "eng_dev2_recv", "eng_dev2_dev", "eng_dev3_recv",
+                     "eng_dev3_dev", "eng_air", "eng_global",
+                     "eng_Q_left_W", "eng_Q_right_W"]
+    if start_epoch == 1 or not os.path.exists(energy_log_path):
+        with open(energy_log_path, "w", newline="") as f:
+            csv.writer(f).writerow(energy_header)
+
     # ------------------------------------------------------------ train loop
     nd = C.TRAIN["n_dom"]
     n_if, n_bnd = C.TRAIN["n_iface"], C.TRAIN["n_bnd"]
+    n_energy = C.TRAIN["n_energy"]
+    # Integral constraints use a persistent deterministic midpoint rule.
+    # PDE/interface/boundary collocation remains randomly resampled.
+    eng_if_samples = S.sample_all_interfaces(
+        n_energy, x1, x2, device, deterministic=True)
+    eng_bnd_samples = S.sample_boundaries(
+        n_energy, device, deterministic=True)
 
     def compute_loss(dom_samples, if_samples, bnd_samples):
         l_pde, _ = condLoss(dom_samples)
         l_ifT, l_ifq, _ = ifaceLoss(if_samples)
         l_bc, _ = bcLoss(bnd_samples)
         engLoss.power_scale = condLoss.power_scale
-        l_eng, _ = engLoss(if_samples, bnd_samples)
+        l_eng, eng_details = engLoss(eng_if_samples, eng_bnd_samples)
         loss = (args.w_pde * l_pde + args.w_if_T * l_ifT
                 + args.w_if_q * l_ifq + args.w_bc * l_bc
                 + args.w_eng * l_eng)
-        return loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng)
+        return loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng), eng_details
+
+    def write_energy_log(epoch, phase, details):
+        row = [epoch, phase] + [
+            float(details[key]) for key in energy_header[2:]
+        ]
+        with open(energy_log_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
 
     # Continuous power continuation: the physical solution is O(power) away
     # from the trivial flat state, so a slow ramp lets the field track the
@@ -271,7 +332,7 @@ def main():
         if_samples = S.sample_all_interfaces(n_if, x1, x2, device)
         bnd_samples = S.sample_boundaries(n_bnd, device)
         ## compute loss and backprop
-        loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(
+        loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng), eng_details = compute_loss(
             dom_samples, if_samples, bnd_samples)
 
         optimizer.zero_grad()
@@ -293,6 +354,7 @@ def main():
                    scheduler.get_last_lr()[0], time.time() - t0]
             with open(log_path, "a", newline="") as f:
                 csv.writer(f).writerow(row)
+            write_energy_log(epoch, "adam", eng_details)
             print(f"ep {epoch:6d}  loss {float(loss):.3e}  "
                   f"pde {float(l_pde):.2e}  ifT {float(l_ifT):.2e}  "
                   f"ifq {float(l_ifq):.2e}  bc {float(l_bc):.2e}  "
@@ -336,14 +398,15 @@ def main():
 
             def closure():
                 lb.zero_grad()
-                l, _ = compute_loss(*fixed)
+                l, _, _ = compute_loss(*fixed)
                 l.backward()
                 return l
 
             t0 = time.time()
             l_val = lb.step(closure)
             if step % 10 == 0 or step == args.lbfgs_steps:
-                _, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(*fixed)
+                _, (l_pde, l_ifT, l_ifq, l_bc, l_eng), eng_details = \
+                    compute_loss(*fixed)
                 flux = M.energy_report(field, device, args.power_scale,
                                        n=257, right_bc=args.right_bc)
                 tmax = M.device_Tmax(field, float(x1), float(x2), device,
@@ -358,6 +421,7 @@ def main():
                        tmax["dev3"] - 273.15, -1.0, time.time() - t0]
                 with open(log_path, "a", newline="") as f:
                     csv.writer(f).writerow(row)
+                write_energy_log(epoch_tag, "lbfgs", eng_details)
                 print(f"lb {step:5d}  loss {float(l_val):.3e}  "
                       f"pde {float(l_pde):.2e}  ifT {float(l_ifT):.2e}  "
                       f"ifq {float(l_ifq):.2e}  bc {float(l_bc):.2e}  "
