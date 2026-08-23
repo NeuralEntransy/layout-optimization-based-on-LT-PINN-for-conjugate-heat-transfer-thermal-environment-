@@ -75,7 +75,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-# default per-domain Fourier sigma (0 = disabled).  With the v2 parameters
+# default per-domain Fourier sigma (0 = disabled).  With the v4 parameters
 # (disk device 20 W) the field is smooth enough for plain tanh MLPs; the
 # --fourier-sigma CLI flag can re-enable them if steep gradients reappear.
 _FOURIER_SIGMA = dict(tbl=0.0, wall_l=0.0, wall_r=0.0, wall_b=0.0,
@@ -83,26 +83,13 @@ _FOURIER_SIGMA = dict(tbl=0.0, wall_l=0.0, wall_r=0.0, wall_b=0.0,
 
 
 class TemperatureField(nn.Module):
-    """theta(x) per domain; physical coords in, normalized theta out.
-
-    The air branch carries a learnable *halo enrichment* around the disk
-    device:  theta_air += halo_A * ln(R_far/r) / ln(R_far/R3).
-    ln(r) is exactly harmonic in 2-D (nabla^2 ln r = 0 for r > 0), so the
-    enrichment satisfies the air PDE by itself while giving the optimizer a
-    direct global amplitude channel for the disk's thermal halo -- otherwise
-    the air-side gradient (coefficient ~ k_F/k_Al in the flux-continuity
-    loss) learns 6000x more slowly than the device side and the hotspot
-    stalls.  halo_A = 0 at init.
-    """
+    """theta(x) per domain; physical coords in, normalized theta out."""
 
     DOMAINS = G.DOMAINS
-    HALO_R_FAR = 0.55   # decay reference radius of the log halo [m]
 
     def __init__(self, width=96, depth=5, theta_init=None,
-                 fourier_sigma=None, fourier_dim=64, halo=True):
+                 fourier_sigma=None, fourier_dim=64):
         super().__init__()
-        import config as C
-        self._C = C
         sig = dict(_FOURIER_SIGMA)
         if fourier_sigma is not None:           # global override (CLI)
             sig = {d: fourier_sigma for d in self.DOMAINS}
@@ -115,12 +102,6 @@ class TemperatureField(nn.Module):
             self.register_buffer(f"scale_{d}", torch.tensor(s).float())
             self.register_buffer(f"outscale_{d}",
                                  torch.tensor(float(_OUTPUT_SCALE[d])))
-        self.halo = halo and ("air" in self.DOMAINS)
-        if self.halo:
-            self.halo_A = nn.Parameter(torch.tensor(0.0))
-            self.register_buffer("c3", torch.tensor(C.C3).float())
-            self._halo_den = float(torch.log(torch.tensor(
-                self.HALO_R_FAR / C.R3)))
         if theta_init is not None and theta_init > 0:
             # warm start: uniform initial temperature level theta_init
             for d in self.DOMAINS:
@@ -129,21 +110,10 @@ class TemperatureField(nn.Module):
                 nn.init.constant_(out.bias,
                                   theta_init / _OUTPUT_SCALE[d])
 
-    def halo_profile(self, r):
-        """1 at r = R3, decays logarithmically to 0 at R_far, 0 beyond.
-        Harmonic (nabla^2 ln r = 0) where smooth; the kink at R_far is a
-        measure-zero cone."""
-        C = self._C
-        h = torch.log(self.HALO_R_FAR / r.clamp(min=C.R3)) / self._halo_den
-        return torch.where(r < self.HALO_R_FAR, h, torch.zeros_like(h))
-
     def forward(self, domain, pts):
         z = (pts - getattr(self, f"center_{domain}")) \
             / getattr(self, f"scale_{domain}")
         out = getattr(self, f"outscale_{domain}") * self.nets[domain](z)
-        if self.halo and domain == "air":
-            r = torch.linalg.vector_norm(pts - self.c3, dim=1, keepdim=True)
-            out = out + self.halo_A * self.halo_profile(r)
         return out
 
     def temperature_K(self, domain, pts):

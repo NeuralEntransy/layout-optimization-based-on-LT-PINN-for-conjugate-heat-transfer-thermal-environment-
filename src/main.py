@@ -16,7 +16,7 @@ parameterization of geometry.DesignVars but are FROZEN in milestone 1
 (fixed layout validation against the milestone-0 FEM reference).
 
 Usage (torch env):
-    python src/main.py --layout center --epochs 30000
+    python src/main.py --lr 1e-3 --epochs 30000 --layout center --device cuda:0
     python src/main.py --layout center --power-scale 0.1 --epochs 2000  # debug
     python src/main.py --layout center --resume                          # continue
 
@@ -35,10 +35,12 @@ import torch
 
 import config as C
 import geometry as G
+import sampling as S
 import monitors as M
 from networks import TemperatureField
+from live_plot import LiveTemperaturePlot
 from losses import ConductionLoss, InterfaceLoss, BoundaryLoss, \
-    EnergyBudgetLoss
+    EnergyConservationLoss
 
 # old 3.1.2 checkpoints live in ../checkpoint and must NOT be touched here
 DEFAULT_CKPT_ROOT = os.path.join(os.path.dirname(__file__), "..",
@@ -53,53 +55,68 @@ def parse_args():
     p.add_argument("--x2", type=float, default=None, help="override layout x2")
     p.add_argument("--epochs", type=int, default=C.TRAIN["epochs"],
                    help="Adam-phase epochs")
-    p.add_argument("--lbfgs-steps", type=int, default=0,
+    p.add_argument("--lbfgs-steps", type=int,
+                   default=C.TRAIN["lbfgs_steps"],
                    help="L-BFGS polish steps after the Adam phase "
                         "(quasi-Newton handles the stiff coupled valley)")
-    p.add_argument("--lbfgs-max-iter", type=int, default=20)
-    p.add_argument("--lbfgs-history", type=int, default=50)
-    p.add_argument("--lbfgs-resample", type=int, default=100,
+    p.add_argument("--lbfgs-max-iter", type=int,
+                   default=C.TRAIN["lbfgs_max_iter"])
+    p.add_argument("--lbfgs-history", type=int,
+                   default=C.TRAIN["lbfgs_history"])
+    p.add_argument("--lbfgs-resample", type=int,
+                   default=C.TRAIN["lbfgs_resample"],
                    help="resample collocation points every N L-BFGS steps "
                         "(0 = keep fixed)")
     p.add_argument("--lr", type=float, default=C.TRAIN["lr"])
     p.add_argument("--width", type=int, default=C.TRAIN["width"])
     p.add_argument("--depth", type=int, default=C.TRAIN["depth"])
-    p.add_argument("--power-scale", type=float, default=1.0,
+    p.add_argument("--power-scale", type=float,
+                   default=C.TRAIN["power_scale"],
                    help="final heat-source scale")
     p.add_argument("--right-bc", choices=["dirichlet", "robin"],
                    default=C.RIGHT_BC,
                    help="right boundary: v4 ideal heat sink or comparison")
-    p.add_argument("--power-start", type=float, default=None,
+    p.add_argument("--power-start", type=float,
+                   default=C.TRAIN["power_start"],
                    help="ramp start scale (default: = power-scale, no ramp)")
     p.add_argument("--ramp", choices=["none", "linear", "exp"],
-                   default="exp", help="power continuation schedule")
-    p.add_argument("--ramp-frac", type=float, default=0.8,
+                   default=C.TRAIN["ramp"],
+                   help="power continuation schedule")
+    p.add_argument("--ramp-frac", type=float,
+                   default=C.TRAIN["ramp_frac"],
                    help="fraction of epochs over which power ramps up")
     p.add_argument("--w-pde", type=float, default=C.TRAIN["w_pde"])
     p.add_argument("--w-pde-dev", type=float, default=C.TRAIN["w_pde_dev"])
     p.add_argument("--w-eng", type=float, default=C.TRAIN["w_eng"])
-    p.add_argument("--halo-lr-mult", type=float, default=5.0,
-                   help="learning-rate multiplier for the halo amplitude "
-                        "parameter (direct amplitude channel)")
     p.add_argument("--w-if-T", type=float, default=C.TRAIN["w_if_T"])
     p.add_argument("--w-if-q", type=float, default=C.TRAIN["w_if_q"])
     p.add_argument("--w-bc", type=float, default=C.TRAIN["w_bc"])
-    p.add_argument("--fourier-sigma", type=float, default=None,
+    p.add_argument("--fourier-sigma", type=float,
+                   default=C.TRAIN["fourier_sigma"],
                    help="override per-domain Fourier sigma globally "
                         "(default: per-domain table in networks.py; "
                         "0 disables Fourier features)")
-    p.add_argument("--fourier-dim", type=int, default=64)
-    p.add_argument("--theta-init", type=float, default=0.0,
+    p.add_argument("--fourier-dim", type=int,
+                   default=C.TRAIN["fourier_dim"])
+    p.add_argument("--theta-init", type=float,
+                   default=C.TRAIN["theta_init"],
                    help="uniform warm-start temperature level (theta units)")
     p.add_argument("--seed", type=int, default=C.TRAIN["seed"])
     p.add_argument("--device", default="auto")
     p.add_argument("--resume", action="store_true",
                    help="load <ckptdir>/latest.pt (default: fresh start)")
+    p.add_argument("--resume-lr", type=float, default=None,
+                   help="override the current Adam learning rate after "
+                        "loading a resume checkpoint; keeps optimizer "
+                        "moments and scheduler progress")
     p.add_argument("--init-from", default=None,
                    help="warm-start field weights from another checkpoint "
                         "(fresh optimizer/scheduler; for power ramp stages)")
     p.add_argument("--eval-every", type=int, default=C.TRAIN["eval_every"])
     p.add_argument("--save-every", type=int, default=C.TRAIN["save_every"])
+    p.add_argument("--no-plot", action="store_false", dest="live_plot",
+                   default=C.TRAIN["live_plot"],
+                   help="disable the live temperature-field window")
     p.add_argument("--ckptdir", default=None)
     p.add_argument("--outdir", default=None)
     return p.parse_args()
@@ -137,25 +154,40 @@ def main():
                              fourier_dim=args.fourier_dim).to(device)
     design = G.DesignVars(x1_0, x2_0, trainable=False, device=device)
     x1, x2 = design.x1(), design.x2()          # frozen tensors (milestone 1)
+    plotter = LiveTemperaturePlot(
+        outdir, C.TRAIN["plot_resolution"]) if args.live_plot else None
 
     condLoss = ConductionLoss(field, power_scale=args.power_scale,
                               w_dev=args.w_pde_dev)
     ifaceLoss = InterfaceLoss(field)
     bcLoss = BoundaryLoss(field, right_bc=args.right_bc)
-    engLoss = EnergyBudgetLoss(field)
+    engLoss = EnergyConservationLoss(field)
 
-    net_params = [p for n, p in field.named_parameters()
-                  if n != "halo_A"]
-    param_groups = [{"params": net_params, "lr": args.lr}]
-    if getattr(field, "halo", False):
-        param_groups.append({"params": [field.halo_A],
-                             "lr": args.lr * args.halo_lr_mult})
-    optimizer = torch.optim.Adam(param_groups, lr=args.lr)
+    optimizer = torch.optim.Adam(field.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2)
 
     start_epoch = 1
     ckpt_path = os.path.join(ckptdir, "latest.pt")
+
+    def save_checkpoint(epoch, lbfgs_optimizer=None):
+        """Save a numbered training snapshot and refresh latest.pt."""
+        state = dict(field=field.state_dict(),
+                     optimizer=optimizer.state_dict(),
+                     scheduler=scheduler.state_dict(),
+                     case=C.CASE_VERSION,
+                     right_bc=args.right_bc,
+                     design=dict(z1=float(design.z1),
+                                 z2=float(design.z2)),
+                     epoch=epoch,
+                     phase="lbfgs" if lbfgs_optimizer is not None else "adam",
+                     args=vars(args))
+        if lbfgs_optimizer is not None:
+            state["lbfgs"] = lbfgs_optimizer.state_dict()
+        history_path = os.path.join(ckptdir, f"epoch_{epoch:06d}.pt")
+        torch.save(state, history_path)
+        torch.save(state, ckpt_path)
+
     if args.resume and os.path.exists(ckpt_path):
         ck = torch.load(ckpt_path, map_location=device, weights_only=False)
         field.load_state_dict(ck["field"])
@@ -163,6 +195,17 @@ def main():
         scheduler.load_state_dict(ck["scheduler"])
         start_epoch = ck["epoch"] + 1
         print(f"[resume] from {ckpt_path} @ epoch {ck['epoch']}")
+        if args.resume_lr is not None:
+            if args.resume_lr <= 0:
+                raise ValueError("--resume-lr must be positive")
+            for group in optimizer.param_groups:
+                group["lr"] = args.resume_lr
+                group["initial_lr"] = args.resume_lr
+            scheduler.base_lrs = [args.resume_lr] * len(optimizer.param_groups)
+            scheduler.eta_min = args.resume_lr * 1e-2
+            scheduler._last_lr = [args.resume_lr] * len(optimizer.param_groups)
+            print(f"[resume] learning rate overridden to "
+                  f"{args.resume_lr:g}; scheduler epoch retained")
     elif args.init_from and os.path.exists(args.init_from):
         ck = torch.load(args.init_from, map_location=device,
                         weights_only=False)
@@ -216,17 +259,18 @@ def main():
         if args.ramp == "linear":
             return p_start + (args.power_scale - p_start) * f
         return args.power_scale
-
+#### Training loop: Adam phase, then optional L-BFGS polish
     t_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
+        ## sample collocation points
         t0 = time.time()
         condLoss.power_scale = power_at(epoch)
 
-        dom_samples = {d: G.sample_domain(d, nd[d], x1, x2, device)
+        dom_samples = {d: S.sample_domain(d, nd[d], x1, x2, device)
                        for d in G.DOMAINS}
-        if_samples = G.sample_all_interfaces(n_if, x1, x2, device)
-        bnd_samples = G.sample_boundaries(n_bnd, device)
-
+        if_samples = S.sample_all_interfaces(n_if, x1, x2, device)
+        bnd_samples = S.sample_boundaries(n_bnd, device)
+        ## compute loss and backprop
         loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng) = compute_loss(
             dom_samples, if_samples, bnd_samples)
 
@@ -258,15 +302,13 @@ def main():
                   f"T1 {tmax['dev1']-273.15:6.1f}C  T2 {tmax['dev2']-273.15:6.1f}C  "
                   f"T3 {tmax['dev3']-273.15:6.1f}C", flush=True)
 
+        if plotter is not None and (epoch % C.TRAIN["plot_every"] == 0
+                                    or epoch == args.epochs):
+            plotter.update(field, x1, x2, device, f"epoch {epoch}",
+                           loss, condLoss.power_scale)
+
         if epoch % args.save_every == 0 or epoch == args.epochs:
-            torch.save(dict(field=field.state_dict(),
-                            optimizer=optimizer.state_dict(),
-                            scheduler=scheduler.state_dict(),
-                            case=C.CASE_VERSION,
-                            right_bc=args.right_bc,
-                            design=dict(z1=float(design.z1),
-                                        z2=float(design.z2)),
-                            epoch=epoch, args=vars(args)), ckpt_path)
+            save_checkpoint(epoch)
 
     # ------------------------------------------------------------ L-BFGS phase
     # The coupled device-paraboloid -> interface-flux -> air-hotspot chain
@@ -282,10 +324,10 @@ def main():
             tolerance_change=1e-14, line_search_fn="strong_wolfe")
 
         def _samples():
-            return ({d: G.sample_domain(d, nd[d], x1, x2, device)
+            return ({d: S.sample_domain(d, nd[d], x1, x2, device)
                      for d in G.DOMAINS},
-                    G.sample_all_interfaces(n_if, x1, x2, device),
-                    G.sample_boundaries(n_bnd, device))
+                    S.sample_all_interfaces(n_if, x1, x2, device),
+                    S.sample_boundaries(n_bnd, device))
 
         fixed = _samples()
         for step in range(1, args.lbfgs_steps + 1):
@@ -326,16 +368,15 @@ def main():
                       f"T1 {tmax['dev1']-273.15:6.1f}C  "
                       f"T2 {tmax['dev2']-273.15:6.1f}C  "
                       f"T3 {tmax['dev3']-273.15:6.1f}C", flush=True)
+            epoch_tag = args.epochs + step
+            if plotter is not None and (
+                    epoch_tag % C.TRAIN["plot_every"] == 0
+                    or step == args.lbfgs_steps):
+                plotter.update(field, x1, x2, device,
+                               f"L-BFGS {step}", l_val,
+                               args.power_scale)
             if step % 50 == 0 or step == args.lbfgs_steps:
-                torch.save(dict(field=field.state_dict(),
-                                optimizer=optimizer.state_dict(),
-                                scheduler=scheduler.state_dict(),
-                                case=C.CASE_VERSION,
-                                right_bc=args.right_bc,
-                                design=dict(z1=float(design.z1),
-                                            z2=float(design.z2)),
-                                epoch=args.epochs + step,
-                                args=vars(args)), ckpt_path)
+                save_checkpoint(args.epochs + step, lb)
 
     # ------------------------------------------------------------ final report
     condLoss.power_scale = args.power_scale       # ensure full-power metrics

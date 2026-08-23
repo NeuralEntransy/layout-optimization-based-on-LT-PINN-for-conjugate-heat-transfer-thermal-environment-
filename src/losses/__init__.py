@@ -4,7 +4,7 @@
 from .conduction import ConductionLoss
 from .interface import InterfaceLoss
 from .boundary import BoundaryLoss
-from .energy_budget import EnergyBudgetLoss
+from .energy_conservation import EnergyConservationLoss
 
 __all__ = ["ConductionLoss", "InterfaceLoss", "BoundaryLoss",
-           "EnergyBudgetLoss"]
+           "EnergyConservationLoss"]

@@ -42,8 +42,8 @@ P = dict(
     # geometry [m]
     x_tbl=-0.005,            # aerogel outer face
     w_in=0.01,              # wall inner offset (frame thickness)
-    d1=0.2,  P1=200.0,      # device 1: small square on bottom wall
-    d2=0.35, P2=400.0,      # device 2: large square on top wall
+    d1=0.2,  P1=270.0,      # device 1: small square on bottom wall
+    d2=0.35, P2=540.0,      # device 2: large square on top wall
     c3=(0.5, 0.4), R3=0.1, P3=20.0,    # device 3: fixed disk
     b=1.0,                  # extrusion thickness
     # materials

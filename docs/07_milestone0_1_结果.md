@@ -117,7 +117,7 @@ src/
     conduction.py     # 分域导热残差（各方程除以自身 k；设备含 S_k 源项，源项加权 --w-pde-dev）
     interface.py      # 材料界面的温度连续 + 热流连续（唯一含导热系数比的位置）
     boundary.py       # 左 x=0 气凝胶一维 Robin、上/下绝热、右 Robin（物理热流形式/Q_REF 归一）
-    energy_budget.py  # 每设备 + 全局能量预算残差（积分型约束，驱动排热/热点形成）
+    energy_conservation.py  # 每设备 + 全局能量守恒残差（积分型约束，驱动排热/热点形成）
   monitors.py      # 边界排热、能量守恒、设备 T_max、安装界面连续性、气凝胶一维化检验
   main.py          # Milestone 1 训练入口（重写）：Adam 阶段 + L-BFGS 阶段
   validate.py      # 与 Milestone 0 FEM 参考解对比

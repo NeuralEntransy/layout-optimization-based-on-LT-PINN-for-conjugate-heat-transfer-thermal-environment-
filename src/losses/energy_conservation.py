@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Per-device and global steady heat-budget losses (integral constraints).
+Per-device and global steady energy-conservation losses (integral constraints).
 
 At steady state, each device must export exactly its own power through its
 surface, and the whole domain must export P_tot through the outer boundary.
@@ -23,7 +23,7 @@ import config as C
 import geometry as G
 from .conduction import grad
 
-P_OF_DEV = dict(dev1=C.P1, dev2=C.P2, dev3=C.P3)
+P_OF_DEV = dict(dev1=C.P1, dev2=C.P2, dev3=C.P3) # extract the device powers from config
 
 
 def _n_out_tensor(meta, dirs, device):
@@ -33,7 +33,7 @@ def _n_out_tensor(meta, dirs, device):
     return v.expand(dirs.shape[0], 2)
 
 
-class EnergyBudgetLoss(torch.nn.Module):
+class EnergyConservationLoss(torch.nn.Module):
     def __init__(self, field):
         super().__init__()
         self.field = field
@@ -45,13 +45,20 @@ class EnergyBudgetLoss(torch.nn.Module):
         th = self.field(dom, pts)
         g = grad(th, pts)
         q_out = -C.K_OF_DOMAIN[dom] * C.DT / C.L_REF \
-            * torch.sum(g * n_out, dim=1, keepdim=True)
+            * torch.sum(g * n_out, dim=1, keepdim=True) # De-normalization and outward flux calculation
         return q_out.mean()
 
     def forward(self, iface_samples, bnd_samples):
         details = {}
         total = 0.0
         ps = self.power_scale
+        # DEV_IFACES = {
+        #     "dev1": ["dev1_wall", "dev1_air_left", "dev1_air_right",
+        #             "dev1_air_top"],
+        #     "dev2": ["dev2_wall", "dev2_air_left", "dev2_air_right",
+        #             "dev2_air_bottom"],
+        #     "dev3": ["dev3_air"],
+        #     }
         for dev, ifaces in G.DEV_IFACES.items():
             P = P_OF_DEV[dev] * ps
             for side in ("recv", "dev"):
@@ -62,7 +69,7 @@ class EnergyBudgetLoss(torch.nn.Module):
                     recv = b if a == dev else a
                     dom = recv if side == "recv" else dev
                     n_out = _n_out_tensor(G.IFACE_META[name], s["dirs"],
-                                          s["pts"].device)
+                                          s["pts"].device) # _n_out_tensor(meta, dirs, device)
                     qm = self._face_flux(dom, s["pts"], n_out)
                     Q = Q + qm * G.IFACE_META[name]["length"] * C.B
                 r = (Q - P) / P
@@ -71,10 +78,10 @@ class EnergyBudgetLoss(torch.nn.Module):
 
         # global balance: outer boundary outflow = total power
         ptsL = bnd_samples["left"]["pts"]; ptsL.requires_grad_(True)
-        thL = self.field("wall_l", ptsL)
-        gL = grad(thL, ptsL)[:, 0:1]
-        Q_left = C.K_AL * C.DT / C.L_REF * gL.mean() * 1.0 * C.B
-        ptsR = bnd_samples["right"]["pts"]; ptsR.requires_grad_(True)
+        thL = self.field("wall_l", ptsL)     # get the temperature field for the left wall  
+        gL = grad(thL, ptsL)[:, 0:1]    # grad calculation
+        Q_left = C.K_AL * C.DT / C.L_REF * gL.mean() * 1.0 * C.B # compute the heat flux through the left boundary
+        ptsR = bnd_samples["right"]["pts"]; ptsR.requires_grad_(True) 
         thR = self.field("wall_r", ptsR)
         gR = grad(thR, ptsR)[:, 0:1]
         Q_right = -C.K_AL * C.DT / C.L_REF * gR.mean() * 1.0 * C.B
