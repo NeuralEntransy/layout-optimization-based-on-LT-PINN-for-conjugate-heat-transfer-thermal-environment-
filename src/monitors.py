@@ -47,10 +47,14 @@ def _horizontal_flux_segment(field, dom, x0, x1, y, n, sign, device):
     length = abs(x1 - x0)
     # Match approximately the point density of an n-point, one-metre line.
     n_segment = max(2, int(round((n - 1) * length)) + 1)
-    q_per_unit, th = _flux_line(
-        field, dom, _line2(x0, x1, y, n_segment, device),
-        1, C.K_OF_DOMAIN[dom], sign=sign, device=device)
-    return q_per_unit * length, th
+    pts = _line2(x0, x1, y, n_segment, device).requires_grad_(True)
+    th = field(dom, pts)
+    gradient = grad(th, pts)[:, 1:2]
+    q_n = (-sign * C.K_OF_DOMAIN[dom] * C.DT / C.L_REF
+           * gradient)
+    signed = float(q_n.mean() * length * C.B)
+    absolute = float(q_n.abs().mean() * length * C.B)
+    return signed, absolute, th.detach()
 
 
 @torch.no_grad()
@@ -103,33 +107,37 @@ def boundary_fluxes(field, device, n=1025, right_bc=C.RIGHT_BC):
     # The top/bottom edges are three distinct network domains.  In particular,
     # wall_t/wall_b only cover x in [W_IN, 1-W_IN]; using either one over the
     # full width extrapolates it through the two wall-corner strips.
-    top_segments = (
+    top_segments = [
         ("wall_l", 0.0, C.W_IN),
         ("wall_t", C.W_IN, 1.0 - C.W_IN),
         ("wall_r", 1.0 - C.W_IN, 1.0),
-    )
-    bottom_segments = (
+    ]
+    bottom_segments = [
         ("wall_l", 0.0, C.W_IN),
         ("wall_b", C.W_IN, 1.0 - C.W_IN),
         ("wall_r", 1.0 - C.W_IN, 1.0),
-    )
-    Q_top = sum(
-        _horizontal_flux_segment(field, dom, x0, x1_, 1.0, n, +1.0,
-                                 device)[0]
-        for dom, x0, x1_ in top_segments)
-    Q_bottom = sum(
-        _horizontal_flux_segment(field, dom, x0, x1_, 0.0, n, -1.0,
-                                 device)[0]
-        for dom, x0, x1_ in bottom_segments)
+    ]
     if not C.USE_TBL_1D:
-        q_tbl_t, _ = _flux_line(field, "tbl",
-                                _line2(C.X_TBL, 0, 1.0, 65, device),
-                                1, C.K_TBL, sign=+1.0, device=device)
-        Q_top += q_tbl_t * abs(C.X_TBL)   # per-length integral x strip width
-        q_tbl_b, _ = _flux_line(field, "tbl",
-                                _line2(C.X_TBL, 0, 0.0, 65, device),
-                                1, C.K_TBL, sign=-1.0, device=device)
-        Q_bottom += q_tbl_b * abs(C.X_TBL)
+        top_segments.append(("tbl", C.X_TBL, 0.0))
+        bottom_segments.append(("tbl", C.X_TBL, 0.0))
+
+    def integrate_horizontal(side, segments, y, sign):
+        signed_segments = {}
+        absolute_segments = {}
+        for dom, x0, x1_ in segments:
+            signed, absolute, _ = _horizontal_flux_segment(
+                field, dom, x0, x1_, y, n, sign, device)
+            key = f"{side}_{dom}"
+            signed_segments[key] = signed
+            absolute_segments[key] = absolute
+        return (sum(signed_segments.values()), signed_segments,
+                absolute_segments)
+
+    Q_top, Q_top_segments, Q_top_abs_segments = integrate_horizontal(
+        "top", top_segments, 1.0, +1.0)
+    Q_bottom, Q_bottom_segments, Q_bottom_abs_segments = \
+        integrate_horizontal(
+            "bottom", bottom_segments, 0.0, -1.0)
     right_err_K = C.DT * (th_r - C.THETA_INF)
     Q_right_robin = None
     if right_bc == "robin":
@@ -141,7 +149,11 @@ def boundary_fluxes(field, device, n=1025, right_bc=C.RIGHT_BC):
                 right_T_rms_err_K=float(torch.sqrt(
                     torch.mean(right_err_K ** 2))),
                 right_T_max_err_K=float(torch.max(torch.abs(right_err_K))),
-                Q_top=Q_top, Q_bottom=Q_bottom)
+                Q_top=Q_top, Q_bottom=Q_bottom,
+                Q_top_segments=Q_top_segments,
+                Q_bottom_segments=Q_bottom_segments,
+                Q_top_abs_segments=Q_top_abs_segments,
+                Q_bottom_abs_segments=Q_bottom_abs_segments)
 
 
 def _line2(x0, x1_, y, n, device):
@@ -164,7 +176,10 @@ def energy_report(field, device, power_scale=1.0, n=1025,
     fl["balance_lr_err"] = abs(
         P - fl["Q_left"] - fl["Q_right"]) / P
     fl["balance_err"] = abs(P - fl["Q_outer"]) / P
-    fl["adiabatic_leak"] = abs(fl["Q_top"]) + abs(fl["Q_bottom"])
+    fl["adiabatic_net_leak"] = abs(fl["Q_top"]) + abs(fl["Q_bottom"])
+    fl["adiabatic_leak"] = (
+        sum(fl["Q_top_abs_segments"].values())
+        + sum(fl["Q_bottom_abs_segments"].values()))
     return fl
 
 

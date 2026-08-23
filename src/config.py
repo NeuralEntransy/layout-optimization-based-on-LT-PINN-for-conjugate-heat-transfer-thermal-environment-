@@ -91,11 +91,11 @@ Q_IF = 150.0        # characteristic interface flux [W/m^2].  Smaller Q_IF
                     # N_if) acts immediately.  150 keeps gain > cost with
                     # w_pde_dev ~ 400 at any power level.
 
-# Per-domain PDE residual weights. The device Poisson residual is the ONLY
-# term coupling heat-source power into the field; a uniform temperature
-# shift leaves it invariant, so the source needs amplification (via
-# --w-pde-dev) to keep the amplitude-learning rate comparable to the
-# boundary losses.
+# Per-domain PDE residual weights. The device Poisson residual supplies the
+# local heat-source curvature (the integral energy budgets supply additional
+# global power signals). A uniform temperature shift leaves the PDE residual
+# invariant, so the source needs amplification via --w-pde-dev to keep its
+# learning rate comparable to the boundary losses.
 PDE_W_OF_DOMAIN = dict(tbl=1.0, wall_l=1.0, wall_r=1.0, wall_b=1.0,
                        wall_t=1.0, air=1.0, dev1=1.0, dev2=1.0, dev3=1.0)
 
@@ -122,11 +122,14 @@ TRAIN = dict(
     epochs=5000,
     lr=1e-5,
     width=96, depth=5,
-    # recommended full-power continuation
+    # Current warm-start stage remains at the full physical power.
     power_scale=1.0,
     power_start=1.0,
     ramp="none",
     ramp_frac=1.0,
+    # Smoothly introduce the changed objective during a field-only warm start.
+    # The end weights below are reached after this fraction of Adam epochs.
+    loss_ramp_frac=0.4,
     # optional quasi-Newton polish after Adam
     lbfgs_steps=0,
     lbfgs_max_iter=20,
@@ -152,13 +155,18 @@ TRAIN = dict(
     w_pde=1.0, w_if_T=10.0, w_if_q=10.0, w_bc=50.0,
     w_pde_dev=400.0,   # explicit device-Poisson emphasis; residual scale=1
     w_eng=100.0,
+    w_pde_dev_start=100.0,
+    w_bc_start=20.0,
+    w_eng_start=30.0,
     # Inner energy-budget weights. Stage A emphasizes device power recovery
     # while introducing the new wall balances conservatively. They can be
     # raised independently without changing the outer w_eng scale.
     eng_w_device=1.0,
     eng_w_air=1.0,
     eng_w_wall=0.25,
+    eng_w_wall_start=0.0,
     eng_w_global=1.0,
+    eng_w_lr=1.0,
     eng_w_adiabatic=1.0,
     eval_every=100, save_every=1000,
     seed=20231028,

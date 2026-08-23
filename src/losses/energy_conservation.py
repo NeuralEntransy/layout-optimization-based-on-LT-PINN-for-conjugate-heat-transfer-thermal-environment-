@@ -135,7 +135,7 @@ class EnergyConservationLoss(torch.nn.Module):
     """Integral energy budgets with independently tunable component weights."""
 
     def __init__(self, field, w_device=1.0, w_air=1.0, w_wall=1.0,
-                 w_global=1.0, w_adiabatic=1.0):
+                 w_global=1.0, w_lr=1.0, w_adiabatic=1.0):
         super().__init__()
         self.field = field
         self.power_scale = 1.0
@@ -143,13 +143,17 @@ class EnergyConservationLoss(torch.nn.Module):
         self.w_air = w_air
         self.w_wall = w_wall
         self.w_global = w_global
+        self.w_lr = w_lr
         self.w_adiabatic = w_adiabatic
 
     def _face_flux(self, dom, pts, n_out):
         """Mean outward heat flux density [W/m^2] using dom's branch."""
-        pts.requires_grad_(True)
-        theta = self.field(dom, pts)
-        gradient = grad(theta, pts)
+        # Quadrature coordinates are persistent across epochs. Work on a
+        # fresh leaf so coordinate gradients do not accumulate on the cached
+        # sample tensors after every backward pass.
+        eval_pts = pts.detach().clone().requires_grad_(True)
+        theta = self.field(dom, eval_pts)
+        gradient = grad(theta, eval_pts)
         return (-C.K_OF_DOMAIN[dom] * C.DT / C.L_REF
                 * torch.sum(gradient * n_out, dim=1, keepdim=True)).mean()
 
@@ -241,7 +245,13 @@ class EnergyConservationLoss(torch.nn.Module):
         q_outer = q_left + q_right + q_horizontal["top"] \
             + q_horizontal["bottom"]
         r_global = (q_outer - p_total) / p_total
+        # The top/bottom boundaries are physically adiabatic, so QL+QR=P is
+        # also an exact integral identity. Keeping it as a separate residual
+        # prevents a finite-weight optimizer from using vertical leakage to
+        # satisfy only the four-sided global budget.
+        r_lr = (q_left + q_right - p_total) / p_total
         details["eng_global"] = r_global.detach()
+        details["eng_lr"] = r_lr.detach()
         details["eng_Q_left_W"] = q_left.detach()
         details["eng_Q_right_W"] = q_right.detach()
         details["eng_Q_outer_W"] = q_outer.detach()
@@ -250,5 +260,13 @@ class EnergyConservationLoss(torch.nn.Module):
                  + self.w_air * r_air ** 2
                  + self.w_wall * loss_wall
                  + self.w_global * r_global ** 2
+                 + self.w_lr * r_lr ** 2
                  + self.w_adiabatic * loss_adiabatic)
+        details["eng_loss_device"] = loss_device.detach()
+        details["eng_loss_air"] = (r_air ** 2).detach()
+        details["eng_loss_wall"] = loss_wall.detach()
+        details["eng_loss_global"] = (r_global ** 2).detach()
+        details["eng_loss_lr"] = (r_lr ** 2).detach()
+        details["eng_loss_adiabatic"] = loss_adiabatic.detach()
+        details["eng_loss_total"] = total.detach()
         return total, details

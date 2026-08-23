@@ -5,7 +5,7 @@ Milestone 1 v4 validation against the milestone-0 FEM reference.
 Checks (doc 04, sections 6 and 7.2):
   1. mounting-interface temperature / flux continuity (PINN soft losses)
   2. aerogel layer degenerates to the 1D thermal-resistance result
-  3. total energy balance  |P_in - Q_left - Q_right| / P_in
+  3. left/right and four-side energy balances plus adiabatic leakage
   4. pointwise agreement with the FEM temperature field (per-domain rel-L2)
   5. per-device T_max: PINN vs FEM; dev1/dev2 are constraints and dev3 is
      the optimization objective
@@ -148,6 +148,18 @@ def main():
             fem_K=rep_fem["T_max_K"][dom],
             diff_K=rep_pinn["T_max_K"][dom] - rep_fem["T_max_K"][dom])
 
+    fem_q_top = rep_fem.get("Q_top_W", 0.0)
+    fem_q_bottom = rep_fem.get("Q_bottom_W", 0.0)
+    fem_power = C.P_TOT * args.power_scale
+    fem_balance_four_side = abs(
+        fem_power - rep_fem["Q_left_W"] - rep_fem["Q_right_W"]
+        - fem_q_top - fem_q_bottom) / fem_power
+    pinn_energy = rep_pinn["energy"]
+    pinn_adiabatic_rel = pinn_energy["adiabatic_leak"] / fem_power
+    energy_lr_ok = pinn_energy["balance_lr_err"] < 0.01
+    energy_four_side_ok = pinn_energy["balance_err"] < 0.01
+    adiabatic_ok = pinn_adiabatic_rel < 0.01
+
     result = dict(
         layout=args.layout, case=C.CASE_VERSION, right_bc=args.right_bc,
         x1=x1, x2=x2, power_scale=args.power_scale,
@@ -155,13 +167,20 @@ def main():
         pinn=rep_pinn,
         fem_energy=dict(Q_left=rep_fem["Q_left_W"],
                         Q_right=rep_fem["Q_right_W"],
-                        balance_err=rep_fem["energy_balance_err"]),
+                        Q_top=fem_q_top,
+                        Q_bottom=fem_q_bottom,
+                        balance_lr_err=rep_fem["energy_balance_err"],
+                        balance_four_side_err=fem_balance_four_side),
         device_Tmax=dev_cmp,
         field_cmp_global=global_cmp,
         field_cmp_per_domain=per_domain,
         acceptance=dict(
-            energy_balance_lt_1pc=
-            rep_pinn["energy"]["balance_err"] < 0.01,
+            energy_lr_balance_lt_1pc=energy_lr_ok,
+            energy_four_side_balance_lt_1pc=energy_four_side_ok,
+            adiabatic_leak_lt_1pc=adiabatic_ok,
+            adiabatic_leak_rel=pinn_adiabatic_rel,
+            energy_balance_lt_1pc=(
+                energy_lr_ok and energy_four_side_ok and adiabatic_ok),
             aerogel_1D_rel_err=rep_pinn["aerogel"]["rel_err"],
             dev1_below_70C=rep_pinn["constraints"]["dev1_below_70C"],
             dev2_below_70C=rep_pinn["constraints"]["dev2_below_70C"],
@@ -216,12 +235,19 @@ def main():
               f"{rep_fem['T_max_C'][d]:8.2f}")
     print(f"\nglobal rel L2: {global_cmp['rel_L2']:.3e}, "
           f"max abs: {global_cmp['max_abs_K']:.2f} K")
-    print(f"PINN energy: Q_left {rep_pinn['energy']['Q_left']:.1f} W, "
-          f"Q_right {rep_pinn['energy']['Q_right']:.1f} W, "
-          f"balance err {rep_pinn['energy']['balance_err']:.2e}")
+    print(f"PINN energy: Q_left {pinn_energy['Q_left']:.1f} W, "
+          f"Q_right {pinn_energy['Q_right']:.1f} W, "
+          f"Q_top {pinn_energy['Q_top']:.1f} W, "
+          f"Q_bottom {pinn_energy['Q_bottom']:.1f} W, "
+          f"LR/four-side balance "
+          f"{pinn_energy['balance_lr_err']:.2e}/"
+          f"{pinn_energy['balance_err']:.2e}, "
+          f"adiabatic leak {pinn_adiabatic_rel:.2e}")
     print(f"FEM  energy: Q_left {rep_fem['Q_left_W']:.1f} W, "
           f"Q_right {rep_fem['Q_right_W']:.1f} W, "
-          f"balance err {rep_fem['energy_balance_err']:.2e}")
+          f"Q_top {fem_q_top:.1f} W, Q_bottom {fem_q_bottom:.1f} W, "
+          f"LR/four-side balance {rep_fem['energy_balance_err']:.2e}/"
+          f"{fem_balance_four_side:.2e}")
     print(f"aerogel 1D: dT {rep_pinn['aerogel']['dT']:.2f} K vs 1D "
           f"{rep_pinn['aerogel']['dT_1D']:.2f} K "
           f"(rel err {rep_pinn['aerogel']['rel_err']:.2e})")

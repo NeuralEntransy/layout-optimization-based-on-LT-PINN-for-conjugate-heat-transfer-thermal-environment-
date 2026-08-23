@@ -437,11 +437,11 @@ TemperatureField
 默认采用气凝胶一维热阻，因此共有八个温度分支；若设置
 `USE_TBL_1D=False`，则额外增加显式气凝胶分支 `tbl`。
 
-显式 `tbl` 目前只是保留的对比路径，并非与默认模式同等完整：域网络、PDE、
-`tbl_wall` 界面、左端 Dirichlet、上下绝热和监控分支都已存在，但
-`EnergyConservationLoss` 的全局左边界积分仍固定调用 `wall_l`。因此在修正该处
-为读取 `bnd_samples["left"]["dom"]` 之前，`USE_TBL_1D=False` 不应直接用于正式
-训练结论；当前 Milestone 1 正式基线是 `USE_TBL_1D=True`。
+显式 `tbl` 是保留的对比路径：域网络、PDE、`tbl_wall` 界面、左端 Dirichlet、
+上下绝热、被动域积分守恒和监控分支均已接通。全局左边界积分会根据
+`bnd_samples["left"]["dom"]` 自动选择默认模式的 `wall_l` 或显式模式的 `tbl`；
+显式模式还会把 `tbl` 纳入无源被动域预算，并逐段积分其上下边界。当前
+Milestone 1 正式基线仍是 `USE_TBL_1D=True`，显式模式应作为独立对比工况验收。
 
 ### 6.2 使用 `ModuleDict` 管理子网络
 
@@ -666,7 +666,7 @@ $$
 | `ConductionLoss` | 对缩放后的 $\theta$ 求二阶导，计算各域 Laplace/Poisson 残差 |
 | `InterfaceLoss` | 比较两分支的 $\theta$，并用 $k\nabla\theta$ 计算守恒热流 |
 | `BoundaryLoss` | 用 $\theta$ 施加 Dirichlet，用其梯度施加 Robin/绝热条件 |
-| `EnergyConservationLoss` | 对缩放后温度的物理梯度积分，计算设备和全局排热量 |
+| `EnergyConservationLoss` | 对缩放后温度的物理梯度积分，计算设备双侧、空气/被动域、四侧全局、左右直接预算与逐段绝热预算 |
 | `temperature_K()` | 用 $T=T_c+\Delta T\theta$ 还原开尔文温度 |
 | `monitors.py` | 计算设备最高温度、边界热流和界面误差 |
 
@@ -765,7 +765,7 @@ $T^4$ 计算必须使用还原后的绝对温度。
 | `losses/conduction.py` | 对各域施加 Laplace/Poisson 方程 |
 | `losses/interface.py` | 连接各分支，施加温度和热流连续条件 |
 | `losses/boundary.py` | 施加气凝胶热阻、右侧热沉和上下绝热条件 |
-| `losses/energy_conservation.py` | 施加设备级与全局积分能量守恒 |
+| `losses/energy_conservation.py` | 施加设备双侧、空气/被动域、四侧全局、左右直接预算和逐段绝热积分守恒 |
 
 这种设计能够自然表达材料界面的导数跳变，并允许针对不同区域使用不同网络
 尺度和特征配置。代价是子网络参数量较多，界面连续完全依赖软约束，而且
@@ -830,9 +830,10 @@ CSG 的 `max` 等距交会处不可微，这是标准 SDF 表达的正常性质�
 
 ### 7.1 为什么逐点 PDE 之外还需要能量约束
 
-`losses/energy_conservation.py` 定义了设备级和系统级积分能量守恒约束。理论上，当各域
-PDE、界面热流连续和外边界条件都精确满足时，积分能量守恒会自动成立；但在
-PINN 训练过程中，这些条件只被近似满足。
+`losses/energy_conservation.py` 定义了设备双侧、空气、被动材料域、四侧系统边界
+以及逐段绝热边界的积分能量守恒约束。理论上，当各域 PDE、界面热流连续和外边界
+条件都精确满足时，这些积分关系会自动成立；但在 PINN 训练过程中，它们只被近似
+满足。
 
 尤其空气与铝的导热系数比为：
 
@@ -849,7 +850,10 @@ $$
 dev1 必须输出 270 W
 dev2 必须输出 540 W
 dev3 必须输出 20 W
-左右边界合计必须排出 830 W
+空气和每个无源墙体分支必须分别满足净热流为零
+左、右、上、下四侧合计必须排出 830 W
+利用绝热物理，左、右两侧也直接约束为合计排出 830 W
+每一段上、下外边界的积分热流必须趋近于零
 ```
 
 因此它是逐点 PDE 和界面损失的补充，不能替代它们。
@@ -967,8 +971,8 @@ $L=2\pi R_3$，方块单边使用 $D_1$ 或 $D_2$。普通界面连续损失仍�
 随机点；积分能量损失则使用独立、固定的等距中点求积点。二者分离后，Adam
 每轮仍能覆盖不同位置，而能量目标不会因蒙特卡洛换点产生额外波动。
 
-具体来说，若在第 $j$ 个界面上均匀独立采样 $N$ 个点，则
-`_face_flux()` 先计算每个点的法向热流密度：
+具体来说，固定能量求积在第 $j$ 个界面的 $N$ 个等权中点上，先由
+`_face_flux()` 计算法向热流密度：
 
 $$
 q''_i=-k\frac{\Delta T}{L_{ref}}
@@ -982,22 +986,16 @@ $$
 =\frac{1}{N}\sum_{i=1}^{N}q''_i.
 $$
 
-于是代码中的
-
-```python
-qm = q_out.mean()
-Q = Q + qm * length * C.B
-```
-
-对应蒙特卡洛积分估计：
+对应的等距中点求积为：
 
 $$
 Q_{k,j}\approx
 \frac{L_{k,j}b}{N}\sum_{i=1}^{N}q''(\mathbf x_i).
 $$
 
-各界面不是合并后直接平均，而是分别求平均、乘各自真实面积 $L_{k,j}b$，再对
-设备所有表面求和。因此长界面对总热量的贡献自然大于短界面。
+其中点集在整个训练过程中保持不变。各界面不是合并后直接平均，而是
+分别求平均、乘各自真实面积 $L_{k,j}b$，再对设备所有表面求和。因此
+长界面对总热量的贡献自然大于短界面。
 
 固定中点规则消除了训练期间的随机积分方差；对光滑热流，其确定性求积误差通常
 也比同点数纯随机采样更小。增加 `n_energy` 只能降低积分离散误差，不能修正温度
@@ -1073,9 +1071,10 @@ L_{eng,device}
 \right].
 $$
 
-### 7.5 全局左右边界预算
+### 7.5 无源被动域、四侧全局预算与逐段绝热预算
 
-左侧计算边界位于 $x=0$ 的 `wall_l` 外表面，外法向为 $(-1,0)$，因此：
+默认 `USE_TBL_1D=True` 时，左侧计算边界位于 $x=0$ 的 `wall_l` 外表面，外法向
+为 $(-1,0)$，因此：
 
 $$
 Q_{left}
@@ -1083,7 +1082,9 @@ Q_{left}
 \int_0^1\frac{\partial\theta_{wall_l}}{\partial x}\,b\,dy.
 $$
 
-它代表热量从左铝墙经一维气凝胶热阻排向冷端。右侧外法向为 $(1,0)$：
+它代表热量从左铝墙经一维气凝胶热阻排向冷端。显式气凝胶模式则在
+$x=X_{TBL}=-0.005$ 处使用 `tbl` 分支和 $k_{TBL}$ 计算同一外向热流。右侧外法向
+为 $(1,0)$：
 
 $$
 Q_{right}
@@ -1092,8 +1093,9 @@ Q_{right}
 $$
 
 右侧无论采用 Dirichlet 基准还是 Robin 对比边界，实际排热量都由墙体温度梯度
-积分得到。上下外边界按绝热处理，理论排热为零，因此不进入主全局预算；其数值
-泄漏由 `monitors.py` 另行记录。
+积分得到。上下外边界由三个不同墙体分支组成，不能用 `wall_t` 或 `wall_b` 在
+整条 $x\in[0,1]$ 上外推。代码分别按左角段、中间墙段、右角段的真实长度积分；
+显式气凝胶模式还会加入 `tbl` 的上下短边。
 
 从整个共轭传热区域应用高斯–格林公式时，各内部材料界面成对出现。若界面热流
 连续，且两侧外法向相反，则内部界面积分相互抵消，最终只剩系统外边界：
@@ -1102,13 +1104,12 @@ $$
 Q_{left}+Q_{right}+Q_{top}+Q_{bottom}=P_{tot}.
 $$
 
-利用上下绝热条件，才进一步化为 $Q_{left}+Q_{right}=P_{tot}$。
-
-全局相对残差为：
+即使逐点绝热条件尚未完全满足，四侧热流也必须进入当前全局预算。全局相对残差
+定义为：
 
 $$
 r_g
-=\frac{Q_{left}+Q_{right}-P_{tot}}
+=\frac{Q_{left}+Q_{right}+Q_{top}+Q_{bottom}-P_{tot}}
 {P_{tot}},
 \qquad
 P_{tot}=830\ \mathrm W.
@@ -1120,14 +1121,32 @@ $$
 L_{eng,global}=r_g^2.
 $$
 
-最终：
+由于物理边界明确要求上、下绝热，代码还直接加入左右预算：
 
 $$
-L_{eng}
-=L_{eng,device}+L_{eng,air}+L_{eng,global}.
+r_{lr}=\frac{Q_{left}+Q_{right}-P_{tot}}{P_{tot}},
+\qquad
+L_{eng,lr}=r_{lr}^2.
 $$
 
-当前实现还加入无体热源空气域的积分弱守恒：
+该项并不人为规定 $Q_L$ 与 $Q_R$ 各自应占多少，只约束二者之和；具体分配仍由左侧
+气凝胶热阻、右侧温度/换热边界和内部场决定。它与四侧全局项同时存在，可防止有限
+权重优化器用非零 $Q_T/Q_B$ 填补左右排热缺口。
+
+当上下绝热真正收敛时，$Q_{top},Q_{bottom}\rightarrow0$，四侧公式才自然退化为
+$Q_{left}+Q_{right}=P_{tot}$。为了防止上、下边界的正负泄漏在总积分中互相抵消，
+代码还对每一段水平外边界单独构造：
+
+$$
+r_j^{adiab}=\frac{Q_j}{P_{tot}},
+\qquad
+L_{eng,adiab}=\sum_j\left(r_j^{adiab}\right)^2.
+$$
+
+因此 `eng_adiabatic_top/bottom` 是整侧带符号总残差，训练损失本身则累加每个
+`top_*`、`bottom_*` 线段的平方残差，不能靠线段间抵消获得低损失。
+
+当前实现还包含无体热源空气域的积分弱守恒：
 
 $$
 r_{air}=\frac{1}{P_{tot}}
@@ -1136,16 +1155,41 @@ r_{air}=\frac{1}{P_{tot}}
 $$
 
 空气边界包括四段墙体接触面和全部设备接触面。该项把设备接收侧热流与墙体接收
-热流直接联系起来，减少“设备已经输出正确总功率，但热量没有正确传递到外墙”
-的中间丢失。
+热流直接联系起来。四个独立墙体分支也分别满足无源积分守恒：
 
-`main.py` 再通过权重 $\lambda_{eng}$ 将它加入总训练损失，当前默认
-`w_eng=100`。
+$$
+r_d^{wall}=\frac{1}{P_{tot}}
+\int_{\partial\Omega_d}-k_d\nabla T\cdot\mathbf n_d\,dA,
+\qquad d\in\{wall_l,wall_r,wall_b,wall_t\}.
+$$
 
-### 7.6 功率 continuation 与日志量
+每个墙体预算显式包含其外边界、空气接触面、设备安装面以及与相邻墙体分支的
+角部界面。`USE_TBL_1D=False` 时，显式气凝胶 `tbl` 也以相同方式加入无源被动域
+预算。这样能量约束闭合了“设备 → 接收域 → 空气/墙体 → 四侧外边界”的完整链路。
 
-`EnergyConservationLoss.power_scale` 与 `ConductionLoss.power_scale` 同步。若调试时使用
-0.1 倍功率，则 PDE 体热源和积分目标同时变为：
+能量损失的实际组合为：
+
+$$
+L_{eng}=w_{dev}L_{eng,device}
++w_{air}L_{eng,air}
++w_{wall}L_{eng,wall}
++w_{global}L_{eng,global}
++w_{lr}L_{eng,lr}
++w_{adiab}L_{eng,adiab}.
+$$
+
+Stage A 的内层终值依次为 `eng_w_device=1`、`eng_w_air=1`、
+`eng_w_wall=0.25`、`eng_w_global=1`、`eng_w_lr=1`、`eng_w_adiabatic=1`，外层
+终值再乘 `w_eng=100`。其中墙体内层权重在前40% Adam 内从0线性增至0.25，外层
+能量权重同期从30增至100，避免旧场热启动时突然改变全部梯度尺度。
+
+`main.py` 再通过活动权重 $\lambda_{eng}$ 将它加入总训练损失；Stage A 的目标终值
+为 `w_eng=100`。
+
+### 7.6 功率倍率与能量日志量
+
+`EnergyConservationLoss.power_scale` 与 `ConductionLoss.power_scale` 同步。若另行
+调试0.1倍功率，则 PDE 体热源和积分目标同时变为：
 
 $$
 (P_1,P_2,P_3)=(27,54,2)\ \mathrm W,
@@ -1153,7 +1197,11 @@ $$
 
 避免控制方程与能量预算使用不同工况。
 
-模块返回：
+当前 `m1_energy_v2` Stage A 默认直接使用全功率：`power_start=1`、
+`power_scale=1`、`ramp=none`。代码仍保留 `linear/exp` continuation 供新鲜训练或
+消融使用，但它不是本轮能量恢复阶段的默认策略。
+
+模块返回的 `details` 覆盖：
 
 ```text
 total
@@ -1161,14 +1209,20 @@ details = {
     eng_dev1_dev,  eng_dev1_recv,
     eng_dev2_dev,  eng_dev2_recv,
     eng_dev3_dev,  eng_dev3_recv,
-    eng_air, eng_global,
-    eng_Q_left_W, eng_Q_right_W
+    eng_air,
+    eng_wall_l, eng_wall_r, eng_wall_b, eng_wall_t,
+    [eng_tbl], eng_global, eng_lr,
+    eng_adiabatic_top_*, eng_adiabatic_bottom_*,
+    eng_adiabatic_top, eng_adiabatic_bottom,
+    eng_loss_device, eng_loss_air, eng_loss_wall,
+    eng_loss_global, eng_loss_lr, eng_loss_adiabatic, eng_loss_total,
+    与上述预算对应的 eng_Q_*_W
 }
 ```
 
-`total` 保留计算图并参与反向传播；`details` 中的带符号相对残差以及固定求积
-得到的左右排热量经过 `detach()`，只用于日志和诊断，并另存到
-`energy_log.csv`。这样汇总的 `eng` 不会掩盖某个设备、空气域或全局预算错误。
+`total` 保留计算图并参与反向传播；`details` 中的带符号相对残差和固定求积热量
+经过 `detach()`，只用于日志和诊断，并写入 `energy_log.csv`。这使汇总的 `eng`
+不会掩盖某台设备、空气、某段墙体、某段绝热边界或四侧全局预算的错误。
 
 ### 7.7 与其他损失的关系及适用范围
 
@@ -1178,7 +1232,7 @@ details = {
 ConductionLoss：逐点满足各域 Laplace/Poisson 方程
 InterfaceLoss：逐点满足温度和守恒热流连续
 BoundaryLoss：逐点满足气凝胶热阻、右侧热沉和绝热条件
-EnergyConservationLoss：积分校正设备功率和系统总排热幅值
+EnergyConservationLoss：积分约束设备双侧、空气/被动域、四侧全局、左右直接预算和逐段绝热预算
 ```
 
 积分预算只能保证“总量正确”，不能保证局部场正确。例如设备总排热等于额定
@@ -1230,24 +1284,40 @@ Adam + 每轮随机重采样 + 可选功率 continuation
 温度初值，并可按域使用 Fourier 特征；默认 `theta_init=0` 实际保留 Xavier 随机
 初值。
 
-三种启动方式为：
+当前损失定义版本为 `LOSS_VERSION="m1_energy_v2"`。checkpoint 同时保存
+`loss_version`、完整 `objective` 快照（含网络/Fourier、固定几何、材料、功率、
+采样和损失配置）、训练 `phase`，以及 PyTorch CPU/CUDA 和 NumPy 的 RNG 状态。
+启动时据此阻止在不同目标或不同随机序列之间错误恢复。三种启动方式为：
 
 | 模式 | 行为 |
 |---|---|
-| fresh | 从新网络、新 Adam 和新调度器开始，不读取旧 3.1.2 checkpoint |
-| `--resume` | 从当前案例的 `latest.pt` 恢复场网络、Adam、调度器和 epoch |
-| `--resume --resume-from <路径>` | 从指定历史 checkpoint 恢复，用于跳过 `latest.pt` 中更晚的 L-BFGS 快照 |
-| `--resume --resume-lr <值>` | 完整恢复后覆盖当前 Adam 学习率；保留动量，旧余弦周期耗尽时为剩余轮数新建调度周期 |
-| `--init-from` | 只载入场网络权重，重新创建优化器和调度器，用于跨功率热启动 |
+| fresh | 在不含 `latest.pt` 的新目录中，从新网络、新 Adam 和新调度器开始 |
+| `--resume` | 只允许恢复同为 `m1_energy_v2`、`objective` 完全一致、`phase=adam` 且含完整 RNG 状态的 checkpoint；加载场、Adam、调度器、epoch 和 RNG |
+| `--resume --resume-from <路径>` | 从指定的兼容 Adam checkpoint 精确恢复，而不是默认读取当前目录的 `latest.pt` |
+| `--resume --resume-lr <值>` | 在兼容的精确恢复后覆盖当前 Adam 学习率；保留动量，并在旧余弦周期耗尽时为剩余轮数新建周期 |
+| `--init-from <路径>` | 只加载 `TemperatureField` 权重，重新创建 Adam/调度器并从 epoch 1 开始；必须显式给出全新且为空的 `--ckptdir` 和 `--outdir` |
 
-checkpoint 路径包含布局、案例版本、右边界类型和功率倍率，降低不同物理工况
-之间误加载权重的风险。
+精确 `--resume` 还会检查三份 CSV。它们必须全部不存在，或全部存在且
+表头与当前代码一致；已存在时，三表末行的 `epoch/phase` 必须相同、必须是
+Adam，并且 epoch 必须恰好等于恢复的 checkpoint。否则代码拒绝追加，应使用
+`--init-from` 分支到新的空目录。
 
-推荐训练策略的其余参数集中在 `config.TRAIN` 中，因此正式启动通常只需指定
-学习率、Adam epoch 数、布局和设备：
+旧目标下的 checkpoint 与 `m1_energy_v2` 的损失项、权重和梯度尺度不同，只能作为
+`--init-from` 的场权重热启动，不能 `--resume` 其 Adam 或 L-BFGS 状态。同一批点
+复评表明，旧 `latest.pt` 的场在新目标、dev1/dev2功率及四侧总排热上优于
+`epoch_060000.pt`：按 Stage A 起始权重重评的总损失分别为70.18和78.18，按终值
+权重重评则为154.32和180.47。因此本轮优先从旧 `latest.pt` 只提取 field，并写入
+新的 `ckptdir/outdir`；`epoch_060000.pt` 只是体积更小但物理起点较差的备用文件。
+
+推荐训练策略集中在 `config.TRAIN` 中。对已有60k场的推荐启动方式为：
 
 ```powershell
-python src/main.py --lr 1e-3 --epochs 30000 --layout center --device cuda:0
+D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
+  --layout center --device cuda:0 `
+  --init-from checkpoint_m1\center_v4_dirichlet\latest.pt `
+  --ckptdir checkpoint_m1\center_v4_dirichlet_energy_v2_stageA `
+  --outdir results\milestone1\center_v4_dirichlet_energy_v2_stageA `
+  --no-plot
 ```
 
 命令行仍保留全部高级选项，用于消融实验时临时覆盖配置，而不需要修改源码。
@@ -1264,20 +1334,33 @@ L=\lambda_{pde}L_{pde}
 +\lambda_{eng}L_{eng}.
 $$
 
-当前默认权重为：
+当前目标（渐入结束后的）权重为：
 
 | 损失 | 默认权重 |
 |---|---:|
 | 域内 PDE | `w_pde=1` |
-| 设备 Poisson 残差内部附加权重 | `w_pde_dev=100` |
+| 设备 Poisson 残差显式附加权重 | `w_pde_dev=400` |
 | 界面温度连续 | `w_if_T=10` |
-| 界面热流连续 | `w_if_q=100` |
-| 外边界条件 | `w_bc=100` |
+| 界面热流连续 | `w_if_q=10` |
+| 外边界条件 | `w_bc=50` |
 | 积分能量守恒 | `w_eng=100` |
 
-`w_pde_dev` 在 `ConductionLoss` 内部强调设备热源方程，其余权重在
-`compute_loss()` 中组合。能量守恒损失和控制方程共享同一个 `power_scale`，避免
-体热源与目标排热量对应不同功率工况。
+`PDE_RES_SCALE` 中三个设备当前均恢复为1，设备 Poisson 强调完全由
+`ConductionLoss` 内显式的 `w_pde_dev=400` 完成；这避免把物理残差尺度与训练权重
+混在一起。其余外层权重在 `compute_loss()` 中组合。能量守恒损失和控制方程共享
+同一个 `power_scale`，避免体热源与目标排热量对应不同功率工况。
+
+为了避免旧场在第1轮突然承受完整新目标，Stage A 还使用独立于功率的线性损失
+权重渐入。默认在前 `loss_ramp_frac=0.4`，即前2000个 Adam epoch 内，将：
+
+```text
+w_pde_dev: 100 → 400
+w_bc:       20 → 50
+w_eng:      30 → 100
+eng_w_wall:  0 → 0.25
+```
+
+`w_pde=1`、`w_if_T=10`、`w_if_q=10` 及设备/空气/全局/左右/绝热能量内层权重保持不变。
 
 ### 8.4 Adam、动态配点和学习率退火
 
@@ -1321,51 +1404,60 @@ p(e)=p_0\left(\frac{p_f}{p_0}\right)^f,
 f=\min\left(\frac{e}{r_{frac}E},1\right).
 $$
 
-当前 `config.TRAIN` 默认从 $p_0=0.1$ 指数提升到 $p_f=1$，爬坡覆盖 Adam
-阶段前 80%。将 `power_start` 设为与 `power_scale` 相同即可关闭实际爬坡。
-continuation 同时缩放设备 Poisson 源项和能量守恒目标。
+代码保留该机制，但当前 `m1_energy_v2` 能量恢复 Stage A 的默认值是
+`power_start=1`、`power_scale=1`、`ramp=none`：从旧场热启动后直接在全功率目标上
+恢复能量链路，不再重复0.1倍到1倍的课程。若消融实验重新启用 continuation，它会
+同时缩放设备 Poisson 源项和所有能量守恒目标。
+
+这里要区分“功率 continuation”和“损失权重渐入”。本轮功率始终为1倍，但
+`loss_ramp_frac=0.4` 会在前2000轮把 `w_pde_dev/w_bc/w_eng/eng_w_wall` 从
+`100/20/30/0` 线性提升到 `400/50/100/0.25`。这样加载旧 field 后先保留较温和的
+旧目标尺度，再逐渐启用完整墙体能量链路。
 
 ### 8.6 L-BFGS 精修与固定配点
 
-Adam 完成后进入拟牛顿精修，默认步数由 `config.TRAIN["lbfgs_steps"]` 控制；
-设为 0 可以关闭。设备内部曲率、界面热流和
+Adam 完成后可以进入拟牛顿精修，步数由 `config.TRAIN["lbfgs_steps"]` 控制；
+当前 Stage A 默认 `lbfgs_steps=0`，先只运行5000轮小学习率 Adam。设备内部曲率、界面热流和
 低导热空气温度梯度会形成刚性的耦合损失谷；L-BFGS 利用历史参数差和梯度差
 近似二阶曲率，并通过 strong-Wolfe 线搜索选择步长。
 
 一次 `lb.step(closure)` 可能反复调用 `closure()`。为保证这些函数评估对应同一
 目标，域内、界面和边界配点在一个 L-BFGS 步块内保持固定。参数
-`lbfgs_resample` 控制每隔多少个外层 step 更新整组配点；设为 0 则全程固定。
-这在局部优化稳定性与长期空间覆盖之间折中。
+`lbfgs_resample` 控制每隔多少个外层 step 更新整组配点；设为0则全程固定。若换点，
+代码会重建 L-BFGS 优化器并清空旧离散目标对应的曲率历史，避免把无效曲率对带入
+新的配点目标。
 
 需要注意，PyTorch 的 `LBFGS.step()` 返回值通常是本次调用开始时的 closure
-损失，不一定等于更新后的最终损失；代码随后重新计算的各分项损失更能反映当前
-参数状态。L-BFGS 阶段生成的历史 checkpoint 也保存拟牛顿优化器状态；当前
-`--resume` 入口仍以恢复场网络和 Adam/调度器为主，若要从某一 L-BFGS step
-原样续接，还需在训练入口显式加载其中的 `lbfgs` 状态。
+损失。当前代码在记录时重新计算更新后的总损失和各分项，因此 CSV/终端的 L-BFGS
+记录反映当前参数，而不是直接写入 `step()` 的旧返回值。L-BFGS checkpoint
+只额外保存 `lbfgs_meta`（`max_iter/history/resample`），故意不保存 L-BFGS
+曲率历史、固定配点和当前块位置；单独保存庞大的曲率历史也不足以原样续训。
+因此精确 `--resume` 明确拒绝 `phase=lbfgs`；如需把该场作为新 Adam 阶段
+起点，只能 `--init-from` 到新的空目录。
 
 ### 8.7 训练监控、保存与最终验收
 
-Adam 每 `eval_every` 轮、L-BFGS 每 10 个外层 step 记录：
+Adam 每 `eval_every` 轮以及每个 checkpoint 保存轮次、启用时的 L-BFGS 每10个
+外层 step 记录：
 
 - 总损失以及 PDE、界面温度、界面热流、边界和能量守恒分项；
-- 左右边界排热量与全局能量平衡误差；
+- 四侧边界排热量、四侧全局能量平衡、左右排热诊断和绝热泄漏；
 - 右侧边界温度误差及 Robin 对照热流；
 - 三个设备的估计最高温度；
 - 学习率和单步耗时。
 
-这些量写入 `loss_log.csv`。Adam 每 `save_every` 轮、L-BFGS 每 50 步及阶段末尾
-同时保存按累计编号命名的 `epoch_XXXXXX.pt`，并刷新便于续训的 `latest.pt`。
-L-BFGS 使用 `epoch_tag=epochs+step`，因此完成 30000 轮 Adam 和 200 步 L-BFGS
-后，`latest.pt` 的 `epoch` 为 30200、`phase` 为 `lbfgs`。L-BFGS 历史快照额外
-包含拟牛顿优化器状态，但当前入口不会恢复该状态继续同一段 L-BFGS。训练结束后
-强制恢复目标全功率，
+汇总量写入 `loss_log.csv`，积分能量的逐预算明细写入 `energy_log.csv`，逐域 PDE、
+逐界面和逐边界明细写入 `physics_log.csv`。Adam 每 `save_every` 轮、启用时的
+L-BFGS 每50步及阶段末尾同时保存按累计编号命名的 `epoch_XXXXXX.pt`，并刷新
+`latest.pt`。L-BFGS 使用 `epoch_tag=epochs+step`，因此 `latest.pt` 可能成为
+`phase=lbfgs`；它不能用于精确 `--resume`。训练结束后强制恢复目标全功率，
 调用 `full_report()` 生成 `final_report.json`，最后提示运行 `validate.py` 与独立
 FEM 结果比较。
 
 训练损失下降只是必要条件。正式验收应同时检查 PDE、界面连续、边界条件、积分
 能量守恒、设备最高温度和 FEM 场误差，不能仅凭加权总损失判断物理解已经可靠。
 
-当前 `validate.py` 已自动计算 FEM 逐域/全局温度场误差、设备最高温度、左右总
+当前 `validate.py` 已自动计算 FEM 逐域/全局温度场误差、设备最高温度、边界总
 能量、两个安装面的连续误差和气凝胶一维热阻；它尚未在独立配点上重新计算所有
 域 PDE、全部17组界面及全部外边界残差。后者仍是验收计划中的缺口，不能把训练
 日志中的随机批次残差称为完整的独立残差验证。
@@ -1376,7 +1468,8 @@ Adam 阶段的终端输出格式为：
 
 ```text
 ep  100  loss ...  pde ...  ifT ...  ifq ...  bc ...  eng ... |
-Q_L ...  Q_R ...  bal ... | T1 ...C  T2 ...C  T3 ...C
+Q_L ...  Q_R ...  Q_T ...  Q_B ...  bal4 ...  balLR ... |
+T1 ...C  T2 ...C  T3 ...C | wdev ...  wbc ...  weng ...
 ```
 
 L-BFGS 阶段内容相同，只把开头换成 `lb step`。各字段含义为：
@@ -1390,13 +1483,19 @@ L-BFGS 阶段内容相同，只把开头换成 `lb step`。各字段含义为：
 | `ifT` | 材料界面两侧的温度连续残差 | 未乘 `w_if_T` 的分项值 |
 | `ifq` | 材料界面两侧的守恒热流连续残差 | 未乘 `w_if_q` 的分项值 |
 | `bc` | 左侧气凝胶热阻、右侧边界及上下绝热残差 | 未乘 `w_bc` 的分项值 |
-| `eng` | 每台设备双侧及全局积分能量守恒残差 | 未乘 `w_eng` 的分项值 |
+| `eng` | 设备双侧、空气、被动域、四侧全局、左右直接预算和逐段绝热积分残差的加权和 | 未乘外层 `w_eng` 的分项值 |
 | `Q_L` | 通过左外边界向计算域外排出的热量 | W |
 | `Q_R` | 通过右外边界向计算域外排出的热量 | W |
-| `bal` | 左右排热与当前总输入功率的相对不平衡 | 无量纲 |
+| `Q_T` | 通过上外边界向计算域外泄漏的带符号热量 | W |
+| `Q_B` | 通过下外边界向计算域外泄漏的带符号热量 | W |
+| `bal4` | 四侧总排热与当前输入功率的相对不平衡，即 `balance_err` | 无量纲 |
+| `balLR` | 只比较左右排热的工程诊断，即 `balance_lr_err` | 无量纲 |
 | `T1` | dev1 内监控网格上的最高温度 | ℃ |
 | `T2` | dev2 内监控网格上的最高温度 | ℃ |
 | `T3` | dev3 内监控网格上的最高温度 | ℃ |
+| `wdev` | 当前正在使用的设备 PDE 权重 `w_pde_dev` | 渐入期间变化 |
+| `wbc` | 当前正在使用的外边界权重 `w_bc` | 渐入期间变化 |
+| `weng` | 当前正在使用的外层能量权重 `w_eng` | 渐入期间变化 |
 
 其中终端的总损失满足：
 
@@ -1408,43 +1507,64 @@ L=\lambda_{pde}L_{pde}
 +\lambda_{eng}L_{eng},
 $$
 
-但 `pde/ifT/ifq/bc/eng` 打印的是乘外层权重之前的原始分项，便于分别判断各类
-物理约束是否改善。因此不能把几个打印分项直接相加来复原 `loss`，必须先乘对应
-权重；`ConductionLoss` 内部的设备附加权重 `w_pde_dev` 已经包含在 `pde` 中。
+但 `pde/ifT/ifq/bc/eng` 打印的是乘外层权重之前的分项，便于分别判断各类物理
+约束是否改善。因此不能把几个打印分项直接相加来复原 `loss`，必须使用该行记录的
+活动 `w_bc/w_eng`；`ConductionLoss` 内部的活动 `w_pde_dev` 已经包含在 `pde`
+中，`eng` 内部也已包含当时的 `eng_w_wall`。
 
-能量平衡字段定义为：
+真正的全局能量平衡字段定义为：
 
 $$
-\mathrm{bal}
-=\frac{|P_{in}-Q_L-Q_R|}{P_{in}}.
+\mathrm{balance\_err}
+=\frac{|P_{in}-Q_L-Q_R-Q_T-Q_B|}{P_{in}}.
 $$
 
-它使用独立的规则边界监控点计算，不直接复用随机训练批次。当前上下边界应绝热，
-所以终端只用左右排热进行主平衡；上下泄漏量仍会进入完整能量报告。`bal=0.01`
-表示左右边界排热与输入功率相差 1%。
+它使用独立的规则边界监控点计算，不直接复用随机训练批次。另保留：
 
-`loss_log.csv` 比终端多保存以下字段：
+$$
+\mathrm{balance\_lr\_err}
+=\frac{|P_{in}-Q_L-Q_R|}{P_{in}},
+$$
 
-| CSV 字段 | 含义 |
+用于直接观察关心的 $Q_L/Q_R$ 是否回到目标。同一数学残差也以 `eng_lr` 进入固定
+求积的训练能量项，而这里的 monitor 使用独立规则点复核。只有当逐段绝热残差已经使
+$Q_T,Q_B\rightarrow0$ 时，`balance_err` 和 `balance_lr_err` 才应接近一致；不能用
+上下正负泄漏抵消来宣称左右排热已经达标。
+
+绝热边界还有两个单位为 W 的独立 monitor：
+
+$$
+\mathrm{adiabatic\_net\_leak}=|Q_T|+|Q_B|,
+$$
+
+$$
+\mathrm{adiabatic\_leak}
+=\sum_{j\in\{top_*,bottom_*\}}
+\int_{\Gamma_j}|q_n|\,dA.
+$$
+
+前者先在每个整侧做带符号积分，再对上、下两侧取绝对值求和；后者对每个
+真实材料线段积分 $|q_n|$ 后求和，不允许段内或段间正负通量抵消，是更严格的
+绝热泄漏指标。两者都是独立监控量；训练中的 `eng_loss_adiabatic` 则是各段
+归一化带符号积分残差的平方和。
+
+三个 CSV 的职责和字段如下：
+
+| 文件 | 主要字段 |
 |---|---|
-| `Q_right_robin` | 按右壁平均温度和 Robin 公式计算的对照排热量；Dirichlet 模式可为空 |
-| `right_T_rms_err_K` | 右侧温度相对目标温度的 RMS 误差，单位 K |
-| `lr` | 当前 Adam 学习率；L-BFGS 日志中写为 `-1` |
-| `sec` | 本次记录对应步骤的耗时，单位 s |
+| `loss_log.csv` | `epoch/phase`，五类汇总损失，`Q_left/Q_right/Q_top/Q_bottom/Q_outer`，`Q_right_robin`，`right_T_rms_err_K`，`balance_lr_err/balance_err`，`adiabatic_net_leak/adiabatic_leak`，三个最高温度、`lr`，活动 `w_pde_dev/w_bc/w_eng/eng_w_wall` 与 `sec` |
+| `energy_log.csv` | 三设备 `dev/recv` 的带符号相对残差与热量，`eng_air`，四墙及可选 `tbl` 的被动域残差/热量，`eng_global/eng_lr`，每个 `top_*/bottom_*` 段及整侧绝热残差/热量，未加内层权重的 `eng_loss_device/air/wall/global/lr/adiabatic`、内层加权的 `eng_loss_total`，以及固定求积的 `eng_Q_left_W/eng_Q_right_W/eng_Q_outer_W` |
+| `physics_log.csv` | 每个 `pde_<domain>`、每个界面的 `ifT_<name>/ifq_<name>`、左右外边界项，以及每个 `bc_top_*/bc_bottom_*_adiab` |
 
-`energy_log.csv` 另外记录三台设备双侧残差、`eng_air`、`eng_global`，以及固定
-求积得到的 `eng_Q_left_W/eng_Q_right_W`。这些字段用于判断汇总 `eng` 的主导
-来源，并与 `loss_log.csv` 中独立监控网格计算的左右热流交叉检查。
-
-CSV 中还保存与终端相同的 epoch、损失、热量和最高温度字段。Adam 的 `loss` 是
-该 epoch 参数更新前在当前随机批次上算得的值；PyTorch 的 L-BFGS 返回值通常是
-该次 `step()` 首次 closure 的损失，因此 L-BFGS 行中的总 `loss` 不保证是线搜索
-完成后的值，而随后重新计算的五个分项更接近更新后的当前状态。
+Adam 与 L-BFGS 日志都在对应优化器更新后，使用该步的固定/随机批次重新计算当前
+总损失和各分项，因此一行中的损失、热流和温度对应同一组网络参数。两类明细日志
+均使用与该条汇总记录相同的阶段标签，便于
+定位是设备 Poisson、某个接收域、某段墙体还是某段外边界主导了误差。
 
 训练结束时，终端还会打印完整 `final_report.json`。其主要层级包括：
 
-- `energy`：输入功率、四侧热流、左右 Robin 对照、右壁温度误差、全局平衡和
-  上下绝热泄漏；
+- `energy`：输入功率、四侧热流、左右 Robin 对照、右壁温度误差、两种平衡误差，
+  以及整侧净泄漏 `adiabatic_net_leak` 和逐段绝对泄漏 `adiabatic_leak`；
 - `T_max_K/T_max_C`：三个设备的最高温度；
 - `aerogel`：气凝胶等效一维热阻检查；
 - `mount`：设备安装界面的温度与热流连续误差；
@@ -1452,8 +1572,8 @@ CSV 中还保存与终端相同的 epoch、损失、热量和最高温度字段�
 - `feasible_dev12_70C` 与 `objective_Tmax3_C`：当前布局的可行性和 dev3 指标；
 - 布局、案例版本、边界类型、$x_1,x_2$、功率倍率和总运行时间。
 
-这些监控量不全部参与反向传播。`loss` 负责训练，`Q_L/Q_R/bal/T1--T3` 和最终
-报告负责判断训练得到的场是否具有正确的工程物理意义。
+这些监控量不全部参与反向传播。`loss` 负责训练，四侧热流、`bal4/balLR`、
+`T1--T3` 和最终报告负责判断训练得到的场是否具有正确的工程物理意义。
 
 ### 8.9 模型训练说明与参数调节指南
 
@@ -1467,23 +1587,30 @@ CSV 中还保存与终端相同的 epoch、损失、热量和最高温度字段�
 | 参数组 | 默认设置 |
 |---|---|
 | 网络 | `width=96`，`depth=5`，`theta_init=0`（按当前判断表示保留 Xavier 随机初值） |
-| Adam | `lr=1e-3`，`epochs=30000` |
-| 功率 | `power_start=0.1`，`power_scale=1`，指数爬坡覆盖前 80% Adam |
-| L-BFGS | 200 个外层 step，`max_iter=20`，`history=50`，每100步换点 |
+| Adam | `lr=1e-5`，`epochs=5000` |
+| 功率 | `power_start=1`，`power_scale=1`，`ramp=none`，全程全功率 |
+| L-BFGS | `lbfgs_steps=0`，Stage A 默认关闭；可选参数仍为 `max_iter=20`、`history=50`、`resample=0` |
 | 域内点 | air 6000；四墙1000--1500；三设备1200--1500 |
-| 边界点 | 每组界面256点，每段外边界256点 |
-| 损失权重 | PDE 1，设备 PDE 100，界面温度10、通量100，边界100，能量100 |
+| 边界/能量点 | 每组界面256点，每段外边界256点；固定能量中点求积512点 |
+| 外层损失终值 | PDE 1，设备 PDE 400，界面温度/通量各10，边界50，能量100 |
+| 损失权重渐入 | 前40% Adam：设备 PDE `100→400`、边界 `20→50`、能量 `30→100` |
+| 能量内层权重 | 设备1、空气1、墙体 `0→0.25`（同前40%渐入）、四侧全局1、左右直接预算1、逐段绝热1 |
 | 记录 | 每100轮评估，每1000轮保存 checkpoint |
 
-通常只在命令行指定四个常用参数：
+本轮基线是从旧60k训练及其后续精修所得场做“只继承场权重”的能量恢复，推荐命令为：
 
 ```powershell
 D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
-  --lr 1e-3 --epochs 30000 --layout center --device cuda:0
+  --layout center --device cuda:0 `
+  --init-from checkpoint_m1\center_v4_dirichlet\latest.pt `
+  --ckptdir checkpoint_m1\center_v4_dirichlet_energy_v2_stageA `
+  --outdir results\milestone1\center_v4_dirichlet_energy_v2_stageA `
+  --no-plot
 ```
 
-第一次完整运行应保留这组基线。不要在尚未得到基线日志前同时修改网络、采样、
-损失权重和功率课程，否则无法判断是哪一项带来改善或退化。
+这里的 Stage A 指 `m1_energy_v2` 的能量恢复阶段，不是后续 Milestone 3 的辐射
+布局优化 Stage A。第一次运行应保留配置基线；不要同时修改网络、采样、损失权重
+和功率设置，否则无法判断是哪一项带来改善或退化。
 
 #### 8.9.2 推荐调节顺序
 
@@ -1491,7 +1618,7 @@ D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
 
 1. 先检查几何、材料参数、功率和边界条件是否正确；
 2. 用短训练确认损失有限、梯度不出现 `NaN/Inf`、各监控量方向合理；
-3. 调整学习率和功率爬坡，使 Adam 能稳定建立温度与热流幅值；
+3. 先用默认 $10^{-5}$ 小学习率、全功率和前40%损失权重渐入恢复热流；只有新鲜训练不稳定时才消融功率课程；
 4. 根据独立分项调整采样数量，优先增加误差集中的区域，而不是全域等比例加点；
 5. 再调整损失权重，使某一物理条件不会长期被其他项掩盖；
 6. Adam 已进入平台后才判断 L-BFGS 精修效果；
@@ -1510,14 +1637,14 @@ D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
 | `width` | 增加每层特征容量 | 显存、时间和过拟合固定配点风险上升 | 多区域都欠拟合时优先增加 |
 | `depth` | 增加函数组合能力 | `Tanh` 梯度传播更难、二阶导数训练更敏感 | 宽度增加仍不能表达复杂场时再增加 |
 
-学习率建议按倍率调整，而不是做很细的十进制搜索。例如从 $10^{-3}$ 依次比较
-$5\times10^{-4}$ 和 $2\times10^{-4}$。若只有某个物理分项不下降，通常应先查该项
+学习率建议按倍率调整，而不是做很细的十进制搜索。对当前热启动 Stage A，可从
+$10^{-5}$ 比较 $5\times10^{-6}$ 和 $2\times10^{-5}$。若只有某个物理分项不下降，通常应先查该项
 的尺度和采样，不应立即把全局学习率降低几个数量级。
 
 增加网络容量是否有效，应以相同训练预算下的独立验证误差判断。训练损失降低而
 验证网格误差不变，说明瓶颈更可能在采样、损失尺度或优化过程，而非网络容量。
 
-#### 8.9.4 功率 continuation 参数
+#### 8.9.4 功率与损失权重 continuation 参数
 
 | 参数 | 含义 | 调节方式 |
 |---|---|---|
@@ -1525,45 +1652,31 @@ $5\times10^{-4}$ 和 $2\times10^{-4}$。若只有某个物理分项不下降，�
 | `power_start` | Adam 初始功率倍率 | 初期热流/温度剧烈发散时降低；初始阶段已稳定时可提高以缩短训练 |
 | `ramp` | `none/linear/exp` | `exp` 在低功率停留更久；`linear` 更快进入中高功率 |
 | `ramp_frac` | 达到最终功率占 Adam 总轮数的比例 | 高功率阶段不稳定时增大；很早已稳定时减小 |
+| `loss_ramp_frac` | 从起始损失权重达到终值所占 Adam 比例 | 当前0.4；设0会从第1轮直接使用终值 |
+| `w_pde_dev_start` | 设备 PDE 起始权重 | 当前100，线性到400 |
+| `w_bc_start` | 外边界起始权重 | 当前20，线性到50 |
+| `w_eng_start` | 外层能量起始权重 | 当前30，线性到100 |
+| `eng_w_wall_start` | 被动墙体能量内层起始权重 | 当前0，线性到0.25 |
+| `eng_w_lr` | 左右直接总排热预算的内层权重 | 当前1；全程不渐入 |
 
 必须保证 `ConductionLoss.power_scale` 和 `EnergyConservationLoss.power_scale`
 同步。否则设备体热源与边界总排热目标不同，会产生不存在的冲突损失。
 
-如果使用低功率 checkpoint 热启动全功率，优先使用 `--init-from`，只继承场网络
-而重新建立优化器；只有同一工况、同一训练计划的中断恢复才使用 `--resume`。
+损失权重渐入不会改变物理功率，只改变新旧目标之间的优化关注比例。当前默认
+全程全功率，同时在前2000轮逐渐启用更强的设备曲率、边界、总能量和墙体被动域
+约束；诊断时应读取每条 `loss_log.csv` 中记录的活动权重，而不是假定全程已是终值。
 
-同一工况续训但需要降低当前学习率时，使用 `--resume-lr`。例如从已有 epoch
-继续到总计 30000 epoch，并把恢复后的当前学习率改为 $5\times10^{-4}$：
+当前旧60k运行属于旧损失目标，必须使用 `--init-from` 并写入新目录；即使物理
+工况相同，也不能把旧 Adam 动量、调度器或 L-BFGS 曲率历史带入
+`m1_energy_v2`。同点复评后推荐旧 `latest.pt`，因为它虽是旧 L-BFGS 快照，但其中
+的 field 比 `epoch_060000.pt` 更接近新能量目标；`--init-from` 不会载入其中的
+L-BFGS/Adam 状态。推荐命令见8.9.1。
 
-```powershell
-D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
-  --epochs 30000 --layout center --device cuda:0 `
-  --resume --resume-lr 5e-4
-```
-
-这里的 `--epochs 30000` 表示 Adam 阶段的累计目标 epoch，而不是再增加 30000
-轮。`--resume-lr` 不清空 Adam 的一、二阶动量，也不把余弦调度器退回第 0 轮；
-它只重设恢复时刻的学习率。若旧余弦周期尚未结束，则保留已有调度进度；若旧
-周期已经结束且累计目标 epoch 更大，则为剩余 Adam 轮数建立新的余弦退火周期。
-
-若 30000 轮 Adam 后已经执行了 L-BFGS，`latest.pt` 会指向 L-BFGS 快照。要从
-Adam 第 30000 轮继续到累计第 60000 轮，应明确恢复 Adam 历史快照，并保持全
-功率，避免 continuation 回退：
-
-```powershell
-D:\ANACONDA\envs\Pytorch\python.exe src\main.py `
-  --epochs 60000 --layout center --device cuda:0 `
-  --resume --resume-from checkpoint_m1\center_v4_dirichlet\epoch_030000.pt `
-  --resume-lr 1e-4 --power-start 1 --power-scale 1 --ramp none --no-plot
-```
-
-该命令仍使用原来的 checkpoint 和输出目录，并从 Adam epoch 30001 训练到
-epoch 60000，之后再执行配置中的 L-BFGS 精修。由于目录中已经存在第一次运行的
-30010--30200 L-BFGS 日志行，新的 Adam 日志会继续追加在文件末尾，CSV 的 epoch
-列在这一小段内不是严格递增；同名的 `epoch_030050.pt`、`epoch_030100.pt` 等
-历史快照也会被后续 Adam 保存覆盖。`epoch_030000.pt` 本身不会被覆盖。若必须
-完整保留第一次 L-BFGS 历史，应在续训前另行复制旧目录；这是“保持原文件夹”
-带来的记录层面代价。
+只有 checkpoint 的 `loss_version=m1_energy_v2`、完整 `objective` 与当前命令一致，
+且 `phase=adam` 时，才能用 `--resume` 在同一新目录中处理中断恢复。此时
+`--epochs` 是该次 Adam 阶段的累计目标；`--resume-lr` 可覆盖恢复时学习率并保留
+Adam 动量。任一目标权重、功率课程、残差尺度或能量内层权重改变，都应另开目录
+并用 `--init-from` 只热启动场权重。
 
 #### 8.9.5 配点数量与分布
 
@@ -1594,9 +1707,9 @@ epoch 60000，之后再执行配置中的 L-BFGS 精修。由于目录中已经�
 | `w_if_T` | 界面温度连续 | `ifT` 或安装温差长期偏高 | 可产生温度连续但通量错误的解 |
 | `w_if_q` | 界面热流连续 | `ifq`、界面通量验证误差长期偏高 | 强导热侧梯度主导，温度/PDE 收敛变慢 |
 | `w_bc` | 外边界条件 | 右壁温度、气凝胶热阻或绝热泄漏不合格 | 网络过度拟合外边界而忽略内部热源 |
-| `w_eng` | 设备和全局积分守恒 | `eng`、`bal` 长期偏高，排热幅值不足 | 只保证总量，局部 PDE 和热流分配可能错误 |
+| `w_eng` | 设备双侧、空气、被动域、四侧/左右和逐段绝热积分守恒 | `eng`、两种 balance 长期偏高，排热链路不足 | 积分总量压过局部 PDE/界面条件 |
 
-推荐先按 2 倍左右做粗调，并比较完整曲线。例如 `w_if_q: 10→20`，而不是一次
+推荐先按2倍左右做粗调，并比较三个日志中的具体残差。例如 `w_if_q: 10→20`，而不是一次
 提高到 $10^3$。某项的打印值大不一定表示它权重不足，因为各分项归一化方式不同；
 应结合该项的物理验收量判断。
 
@@ -1614,9 +1727,10 @@ epoch 60000，之后再执行配置中的 L-BFGS 精修。由于目录中已经�
 | `lbfgs_history` | 使用更多历史曲率信息 | 占用更多内存；网络较大时优先控制该值 |
 | `lbfgs_resample` | 控制多少外层 step 后换配点 | 值大更利于稳定曲率估计，值小提高空间覆盖但会扰动目标 |
 
-如果 L-BFGS 损失明显跳动，先延长固定配点区间，即增大 `lbfgs_resample` 或设为
-0 做一次固定点诊断；不要首先增加 `max_iter`。如果固定点损失下降而独立验证误差
-变差，说明对该批配点过拟合，应恢复周期重采样或增加验证导向的局部点。
+当前 Stage A 默认关闭 L-BFGS。只有5000轮 Adam 已建立正确能量链且各项进入平台，
+才另做启用 L-BFGS 的对照。若使用 `lbfgs_resample>0`，每次换点都会重建优化器并
+清空曲率历史；若固定点损失下降而独立验证误差变差，应增加验证导向的局部点或
+缩短固定点块，而不是沿用旧曲率历史。
 
 #### 8.9.8 Fourier 与温度初值
 
@@ -1647,15 +1761,21 @@ epoch 60000，之后再执行配置中的 L-BFGS 精修。由于目录中已经�
 `live_plot=True` 时，训练会打开一个非阻塞 Matplotlib 窗口，将各材料分支拼成
 完整温度场，并叠加两个方块和圆设备边界。窗口更新不会参与反向传播，每次更新
 还会覆盖保存 `<outdir>/temperature_live.png`。远程服务器或无图形界面运行时可
-使用 `--no-plot`，训练和数值结果不受影响。当前绘图异常没有被训练循环捕获；在
-Windows 的 TkAgg 后端出现窗口句柄或 `PyCapsule_New` 错误时会中断进程，因此长
-训练建议使用 `--no-plot`。绘图调用位于同一 epoch 的 checkpoint 保存之前，若
-窗口刷新报错，该轮通常不会保存，但此前的 `latest.pt` 不受影响。
+使用 `--no-plot`，训练和数值结果不受影响。当前训练循环会捕获绘图异常，打印
+`[plot warning]` 后禁用窗口，GUI 后端错误不再中断训练；长时间无界面运行仍建议
+显式使用 `--no-plot`。
 
 训练会保留 `epoch_XXXXXX.pt` 并刷新 `latest.pt`。开始新的消融实验时应使用新的
 `ckptdir/outdir` 或能区分配置的案例标签，避免不同参数实验共享日志和历史文件。
-`loss_log.csv`、命令行参数、Git 版本和 `config.TRAIN` 应共同归档，单独保存网络
-权重不足以完整复现实验。
+`loss_log.csv`、`energy_log.csv`、`physics_log.csv`、命令行参数、Git 版本、
+`LOSS_VERSION` 和 `config.TRAIN` 应共同归档，单独保存网络权重不足以完整复现实验。
+
+checkpoint 本身还保存固定几何在内的 `objective` 快照和 CPU/CUDA/NumPy RNG
+状态。精确 `--resume` 除检查网络/Fourier 与这些状态外，还校验三份 CSV 的表头
+与末行 `epoch/phase`；日志缺失一部分、表头过时、三表末行不一致或日志 epoch
+不等于 checkpoint 时都会拒绝追加。`--init-from` 则必须显式指定两个全新空目录，
+并在只加载 field 前核对 `CASE_VERSION`、右边界类型、固定 $x_1,x_2$ 布局和可用的
+网络/物理快照；旧 checkpoint 没有快照时仍由 `state_dict` 结构检查兜底。
 
 #### 8.9.10 现象诊断速查表
 
@@ -1667,9 +1787,10 @@ Windows 的 TkAgg 后端出现窗口句柄或 `PyCapsule_New` 错误时会中断
 | `ifT` 高、`ifq` 低 | 温度连续约束 | 增加界面点或小幅提高 `w_if_T` |
 | `ifT` 低、`ifq` 高 | 通量尺度、导热系数、方向 | 先核对法向和量纲，再调 `w_if_q` |
 | `bc` 高 | 边界采样和边界类型 | 核对 Dirichlet/Robin 配置，增加 `n_bnd` 或 `w_bc` |
-| `eng` 高且 `bal` 高 | 总热流幅值 | 放慢功率爬坡，检查 `w_eng` 和边界排热方向 |
-| `eng` 低但 `bal` 高 | 设备预算与外边界预算不一致 | 检查界面传热、边界条件和监控积分，不盲目调权 |
-| `bal` 低但 FEM 误差高 | 局部场未收敛 | 增加局部点，检查 PDE、界面和最高温度；总量正确不代表场正确 |
+| `eng` 高且 `balance_err` 高 | 总热流幅值或被动域链路 | 查 `energy_log.csv` 的设备/空气/墙体/四侧/逐段残差，再决定是否调 `w_eng` |
+| `balance_err` 低但 `balance_lr_err` 高 | 上下泄漏在四侧总量中补偿左右缺口 | 查逐段绝热项和 `Q_T/Q_B`，不能把四侧总量正确等同于 $Q_L/Q_R$ 达标 |
+| `eng` 低但监控平衡高 | 固定训练求积与独立监控不一致 | 加密求积并检查边界分段、符号和物理日志，不盲目调权 |
+| 两种平衡都低但 FEM 误差高 | 局部场未收敛 | 增加局部点，检查 PDE、界面和最高温度；总量正确不代表场正确 |
 | Adam 平台、各项仍缓慢下降 | 一阶优化进入刚性谷 | 启用或增加 L-BFGS 精修 |
 | L-BFGS 固定点下降、验证变差 | 固定配点过拟合 | 缩短重采样间隔或增加独立/局部验证点 |
 | 设备温度出现明显非物理值 | 符号、尺度、功率、边界 | 先查物理实现，不用权重把异常压下去 |
@@ -1679,8 +1800,8 @@ Windows 的 TkAgg 后端出现窗口句柄或 `PyCapsule_New` 错误时会中断
 可以停止增加训练预算的条件不是“总损失看起来很小”，而是：
 
 1. 多个评估周期内各分项和监控量已经稳定；
-2. 全功率下左右边界总能量不平衡达到第04文档规定的门槛，当前建议小于1%；
-3. 上下绝热泄漏、右边界条件和气凝胶热阻检查合格；
+2. 全功率下四侧 `balance_err` 达到第04文档规定的门槛，当前建议小于1%；
+3. `balance_lr_err` 同时达标，且逐段上下绝热泄漏、右边界条件和气凝胶热阻检查合格；
 4. 当前 `validate.py` 自动检查的两个设备安装面误差合格；全部材料界面还需增加
    独立验证器后再作为自动硬门槛；
 5. 三个设备最高温度在加密监控网格上稳定；

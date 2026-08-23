@@ -1,0 +1,5 @@
+# LT-PINN Python dependencies (PINN training only)
+# FEM reference generation additionally needs dolfinx 0.10 + gmsh
+numpy
+matplotlib
+torch>=2.0
