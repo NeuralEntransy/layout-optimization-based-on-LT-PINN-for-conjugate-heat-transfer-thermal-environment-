@@ -278,7 +278,7 @@ def main():
         loss.backward()
         optimizer.step()
         scheduler.step()
-
+        ## log and report
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             ps_now = condLoss.power_scale
             flux = M.energy_report(field, device, ps_now, n=257,
