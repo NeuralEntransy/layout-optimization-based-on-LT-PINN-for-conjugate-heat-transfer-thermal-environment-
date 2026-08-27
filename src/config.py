@@ -23,7 +23,7 @@ CASE_VERSION = "v4"
 # Checkpoints with a different loss version may still provide compatible
 # TemperatureField weights, but their optimizer/L-BFGS state must not be
 # resumed because the objective and its gradient scales have changed.
-LOSS_VERSION = "m1_energy_v2"
+LOSS_VERSION = "m1_energy_v5_face_flux"
 
 # ---------------------------------------------------------------- geometry [m]
 X_TBL = -0.005          # aerogel outer face (cold side)
@@ -96,8 +96,8 @@ Q_IF = 150.0        # characteristic interface flux [W/m^2].  Smaller Q_IF
 # global power signals). A uniform temperature shift leaves the PDE residual
 # invariant, so the source needs amplification via --w-pde-dev to keep its
 # learning rate comparable to the boundary losses.
-PDE_W_OF_DOMAIN = dict(tbl=1.0, wall_l=1.0, wall_r=1.0, wall_b=1.0,
-                       wall_t=1.0, air=1.0, dev1=1.0, dev2=1.0, dev3=1.0)
+PDE_W_OF_DOMAIN = dict(tbl=1.0, wall_l=1.0, wall_r=1.5, wall_b=1.0,
+                       wall_t=2.0, air=1.0, dev1=1.0, dev2=1.5, dev3=1.0)
 
 # Per-domain PDE residual scale (only relevant for the resolved-layer
 # variant; with USE_TBL_1D the thin aerogel domain is absent).
@@ -117,19 +117,22 @@ LAYOUTS = dict(left=(0.25, 0.35), center=(0.50, 0.50), right=(0.75, 0.65))
 
 # ---------------------------------------------------------------- training defaults
 TRAIN = dict(
-    # Energy-recovery stage A: intended for field-only warm start from the
-    # existing 60k solution. The network shape itself is unchanged.
+    # Face-flux recovery stage: field-only warm start from the best v4
+    # dense checkpoint. The network shape itself is unchanged.
     epochs=5000,
-    lr=1e-5,
+    # A field-only warm start creates a fresh Adam state. Thin-wall physical
+    # derivatives make the first normalized Adam update very sensitive; CUDA
+    # smoke tests showed 1e-5 and 1e-6 produce immediate heat-flux overshoot.
+    lr=2e-7,
+    # Learning-rate decay must be explicit. This recovery stage uses a
+    # constant small Adam learning rate unless cosine is requested on CLI.
+    lr_scheduler="none",
     width=96, depth=5,
     # Current warm-start stage remains at the full physical power.
     power_scale=1.0,
     power_start=1.0,
     ramp="none",
     ramp_frac=1.0,
-    # Smoothly introduce the changed objective during a field-only warm start.
-    # The end weights below are reached after this fraction of Adam epochs.
-    loss_ramp_frac=0.4,
     # optional quasi-Newton polish after Adam
     lbfgs_steps=0,
     lbfgs_max_iter=20,
@@ -144,30 +147,60 @@ TRAIN = dict(
     plot_every=100,
     plot_resolution=151,
     # collocation points per epoch
-    n_dom=dict(tbl=1500, wall_l=1000, wall_r=1000, wall_b=1500, wall_t=1500,
-               air=6000, dev1=1200, dev2=1500, dev3=1200),
-    n_iface=256, n_bnd=256,
+    n_dom=dict(tbl=1500, wall_l=3000, wall_r=3000, wall_b=4000, wall_t=4000,
+               air=15000, dev1=3000, dev2=14000, dev3=2500),
+    # Additional PDE points in material-side boundary layers.
+    n_near_device=dict(dev1=1000, dev2=3000, dev3=500),
+    device_layer_width=0.01,
+    n_near_wall=dict(wall_l_outer=1000, wall_l_inner=1000,
+                     wall_r_outer=1000, wall_r_inner=1000,
+                     wall_b_outer=2000, wall_b_inner=3000,
+                     wall_t_outer=2000, wall_t_inner=3000),
+    wall_layer_width=0.002,
+    # Air-side layers around devices and the two long wall/air interfaces.
+    n_near_air=dict(dev1=1500,
+                    dev2_air_left=1500, dev2_air_right=1500,
+                    dev2_air_bottom=1500,
+                    dev3=1500, wall_b=2000, wall_t=2000),
+    air_layer_width=0.01,
+    # Random point counts are specified per named interface/boundary.
+    n_iface=dict(tbl_wall=834,
+                 wall_air_left=817, wall_air_right=817,
+                 wall_air_bottom=650, wall_air_top=768,
+                 dev1_wall=300, dev1_air_left=300,
+                 dev1_air_right=300, dev1_air_top=300,
+                 dev2_wall=512, dev2_air_left=512,
+                 dev2_air_right=512, dev2_air_bottom=512,
+                 dev3_air=524,
+                 corner_l_b=256, corner_l_t=256,
+                 corner_r_b=256, corner_r_t=256),
+    n_bnd=dict(left=1024, right=1024,
+               top_wall_l=64, top_wall_t=1024, top_wall_r=64,
+               bottom_wall_l=64, bottom_wall_b=1024,
+               bottom_wall_r=64,
+               top_tbl=64, bottom_tbl=64),
+    # Microbatch sizes for one-update-per-epoch gradient accumulation.
+    pde_microbatch=2000,
+    interface_microbatch=512,
+    boundary_microbatch=512,
     # Fixed midpoint quadrature used only by integral energy constraints.
     # Keeping it separate from random collocation removes Monte-Carlo target
     # noise without changing the neural-network architecture.
-    n_energy=512,
+    n_energy=1024,
     # loss weights
-    w_pde=1.0, w_if_T=10.0, w_if_q=10.0, w_bc=50.0,
-    w_pde_dev=400.0,   # explicit device-Poisson emphasis; residual scale=1
+    w_pde=1.5, w_if_T=20.0, w_if_q=20.0, w_bc=75.0,
+    w_pde_dev=600.0,   # explicit device-Poisson emphasis; residual scale=1
     w_eng=100.0,
-    w_pde_dev_start=100.0,
-    w_bc_start=20.0,
-    w_eng_start=30.0,
-    # Inner energy-budget weights. Stage A emphasizes device power recovery
-    # while introducing the new wall balances conservatively. They can be
-    # raised independently without changing the outer w_eng scale.
-    eng_w_device=1.0,
+    bc_w_adiabatic=8.0,
+    # Inner energy-budget weights. Per-face flux continuity prevents an
+    # incorrect air-side heat rate from being hidden by another device face.
+    eng_w_device=2.0,
+    eng_w_face=2.0,
     eng_w_air=1.0,
-    eng_w_wall=0.25,
-    eng_w_wall_start=0.0,
-    eng_w_global=1.0,
-    eng_w_lr=1.0,
-    eng_w_adiabatic=1.0,
+    eng_w_wall=0.75,
+    eng_w_global=3.0,
+    eng_w_lr=5.0,
+    eng_w_adiabatic=20.0,
     eval_every=100, save_every=1000,
     seed=20231028,
 )

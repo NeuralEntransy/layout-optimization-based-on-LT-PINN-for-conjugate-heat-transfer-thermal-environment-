@@ -22,49 +22,53 @@ from .conduction import grad
 
 
 class BoundaryLoss(torch.nn.Module):
-    def __init__(self, field, right_bc=C.RIGHT_BC):
+    def __init__(self, field, right_bc=C.RIGHT_BC, w_adiabatic=1.0):
         super().__init__()
         if right_bc not in {"dirichlet", "robin"}:
             raise ValueError(f"unsupported right boundary: {right_bc}")
         self.field = field
         self.right_bc = right_bc
+        self.w_adiabatic = w_adiabatic
 
     def forward(self, bnd_samples):
         details = {}
         total = 0.0
 
         # left boundary
-        s = bnd_samples["left"]
-        if C.USE_TBL_1D:
-            pts = s["pts"]
-            pts.requires_grad_(True)
-            th = self.field(s["dom"], pts)
-            g = grad(th, pts)[:, 0:1]
-            r = (C.K_AL / C.L_REF * g - C.H_TBL * th) * C.DT / C.Q_REF
-            l = torch.mean(r ** 2)
-            details["bc_left_robin_tbl1d"] = l
-        else:
-            th = self.field(s["dom"], s["pts"])
-            l = torch.mean((th - C.THETA_COLD) ** 2)
-            details["bc_left_dirichlet"] = l
-        total = total + l
+        if "left" in bnd_samples:
+            s = bnd_samples["left"]
+            if C.USE_TBL_1D:
+                pts = s["pts"]
+                pts.requires_grad_(True)
+                th = self.field(s["dom"], pts)
+                g = grad(th, pts)[:, 0:1]
+                r = (C.K_AL / C.L_REF * g
+                     - C.H_TBL * th) * C.DT / C.Q_REF
+                l = torch.mean(r ** 2)
+                details["bc_left_robin_tbl1d"] = l
+            else:
+                th = self.field(s["dom"], s["pts"])
+                l = torch.mean((th - C.THETA_COLD) ** 2)
+                details["bc_left_dirichlet"] = l
+            total = total + l
 
         # right 30 C ideal heat sink (v4 baseline) or Robin comparison
-        s = bnd_samples["right"]
-        pts = s["pts"]
-        if self.right_bc == "robin":
-            pts.requires_grad_(True)
-        th = self.field(s["dom"], pts)
-        if self.right_bc == "dirichlet":
-            l = torch.mean((th - C.THETA_INF) ** 2)
-            details["bc_right_dirichlet"] = l
-        else:
-            g = grad(th, pts)[:, 0:1]
-            r = (-C.K_AL / C.L_REF * g
-                 - C.H_EXT * (th - C.THETA_INF)) * C.DT / C.Q_REF
-            l = torch.mean(r ** 2)
-            details["bc_right_robin"] = l
-        total = total + l
+        if "right" in bnd_samples:
+            s = bnd_samples["right"]
+            pts = s["pts"]
+            if self.right_bc == "robin":
+                pts.requires_grad_(True)
+            th = self.field(s["dom"], pts)
+            if self.right_bc == "dirichlet":
+                l = torch.mean((th - C.THETA_INF) ** 2)
+                details["bc_right_dirichlet"] = l
+            else:
+                g = grad(th, pts)[:, 0:1]
+                r = (-C.K_AL / C.L_REF * g
+                     - C.H_EXT * (th - C.THETA_INF)) * C.DT / C.Q_REF
+                l = torch.mean(r ** 2)
+                details["bc_right_robin"] = l
+            total = total + l
 
         # top / bottom adiabatic on every sampled top_* / bottom_* strip
         for key, s in bnd_samples.items():
@@ -78,5 +82,5 @@ class BoundaryLoss(torch.nn.Module):
             r = C.K_OF_DOMAIN[dom] * C.DT / C.L_REF * g_n / C.Q_REF
             l = torch.mean(r ** 2)
             details[f"bc_{key}_adiab"] = l
-            total = total + l
+            total = total + self.w_adiabatic * l
         return total, details

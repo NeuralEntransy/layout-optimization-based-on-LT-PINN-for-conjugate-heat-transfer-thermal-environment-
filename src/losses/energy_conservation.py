@@ -6,6 +6,7 @@ at the exact solution. During optimization the integral constraints provide
 direct low-frequency signals for:
 
 * each powered device (device and receiving side);
+* each individual device interface (integrated two-sided flux continuity);
 * the source-free air domain;
 * every source-free wall strip (and the explicit aerogel, when enabled);
 * the complete four-sided outer-boundary balance;
@@ -134,12 +135,14 @@ def _normal_tensor(normal, sample):
 class EnergyConservationLoss(torch.nn.Module):
     """Integral energy budgets with independently tunable component weights."""
 
-    def __init__(self, field, w_device=1.0, w_air=1.0, w_wall=1.0,
-                 w_global=1.0, w_lr=1.0, w_adiabatic=1.0):
+    def __init__(self, field, w_device=1.0, w_face=1.0, w_air=1.0,
+                 w_wall=1.0, w_global=1.0, w_lr=1.0,
+                 w_adiabatic=1.0):
         super().__init__()
         self.field = field
         self.power_scale = 1.0
         self.w_device = w_device
+        self.w_face = w_face
         self.w_air = w_air
         self.w_wall = w_wall
         self.w_global = w_global
@@ -177,21 +180,40 @@ class EnergyConservationLoss(torch.nn.Module):
                              "energy constraints")
         p_total = C.P_TOT * ps
         loss_device = 0.0
+        loss_face = 0.0
 
-        # Each device must export its power. The receiving-side heat rate is
-        # projected along the device outward normal, so it represents heat
-        # accepted from the device rather than outward flux of the receiver.
+        # Each device must export its power. In addition to the two total
+        # budgets, match the integrated heat rate on every individual face.
+        # This low-frequency condition is implied by pointwise InterfaceLoss
+        # at the exact solution, but prevents one erroneous receiver face from
+        # being hidden by another face during finite-weight optimization.
         for dev, iface_names in G.DEV_IFACES.items():
             target = P_OF_DEV[dev] * ps
-            for side in ("dev", "recv"):
-                heat_rate = 0.0
-                for name in iface_names:
-                    sample = iface_samples[name]
-                    recv = sample["b"] if sample["a"] == dev else sample["a"]
-                    dom = dev if side == "dev" else recv
-                    meta = G.IFACE_META[name]
-                    heat_rate = heat_rate + self._integral(
-                        dom, sample, meta["n_out"], meta["length"])
+            perimeter = sum(G.IFACE_META[name]["length"]
+                            for name in iface_names)
+            heat_rates = {"dev": 0.0, "recv": 0.0}
+            for name in iface_names:
+                sample = iface_samples[name]
+                recv = sample["b"] if sample["a"] == dev else sample["a"]
+                meta = G.IFACE_META[name]
+                q_dev = self._integral(
+                    dev, sample, meta["n_out"], meta["length"])
+                q_recv = self._integral(
+                    recv, sample, meta["n_out"], meta["length"])
+                heat_rates["dev"] = heat_rates["dev"] + q_dev
+                heat_rates["recv"] = heat_rates["recv"] + q_recv
+
+                # The physical split among faces is not prescribed. The
+                # length-weighted nominal share is only a normalization scale.
+                face_scale = target * meta["length"] / perimeter
+                face_residual = (q_dev - q_recv) / face_scale
+                details[f"eng_face_{name}"] = face_residual.detach()
+                details[f"eng_Q_{name}_dev_W"] = q_dev.detach()
+                details[f"eng_Q_{name}_recv_W"] = q_recv.detach()
+                details[f"eng_dQ_{name}_W"] = (q_dev - q_recv).detach()
+                loss_face = loss_face + face_residual ** 2
+
+            for side, heat_rate in heat_rates.items():
                 residual = (heat_rate - target) / target
                 details[f"eng_{dev}_{side}"] = residual.detach()
                 details[f"eng_Q_{dev}_{side}_W"] = heat_rate.detach()
@@ -257,12 +279,14 @@ class EnergyConservationLoss(torch.nn.Module):
         details["eng_Q_outer_W"] = q_outer.detach()
 
         total = (self.w_device * loss_device
+                 + self.w_face * loss_face
                  + self.w_air * r_air ** 2
                  + self.w_wall * loss_wall
                  + self.w_global * r_global ** 2
                  + self.w_lr * r_lr ** 2
                  + self.w_adiabatic * loss_adiabatic)
         details["eng_loss_device"] = loss_device.detach()
+        details["eng_loss_face"] = loss_face.detach()
         details["eng_loss_air"] = (r_air ** 2).detach()
         details["eng_loss_wall"] = loss_wall.detach()
         details["eng_loss_global"] = (r_global ** 2).detach()

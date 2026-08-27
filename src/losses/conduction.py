@@ -20,7 +20,7 @@ def grad(y, x):
 
 
 class ConductionLoss(torch.nn.Module):
-    def __init__(self, field, power_scale=1.0, w_dev=200.0):
+    def __init__(self, field, power_scale=1.0, w_dev=1000.0):
         super().__init__()
         self.field = field
         self.power_scale = power_scale

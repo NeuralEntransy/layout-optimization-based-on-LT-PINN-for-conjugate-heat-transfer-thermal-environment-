@@ -111,6 +111,162 @@ def sample_domain(name, n, x1, x2, device):
     raise KeyError(name)
 
 
+def sample_near_outer_boundary(name, n, width, device):
+    """Sample wall PDE points concentrated just inside top/bottom boundaries."""
+    if n <= 0:
+        return torch.empty((0, 2), device=device)
+    if not 0.0 < width <= C.W_IN:
+        raise ValueError("near-boundary width must lie in (0, wall thickness]")
+    if name not in {"wall_b", "wall_t"}:
+        raise KeyError(name)
+
+    x = torch.rand(n, device=device) * (1.0 - 2.0 * C.W_IN) + C.W_IN
+    # Squared distances bias points toward the physical boundary while still
+    # covering the complete boundary layer.
+    distance = (width * torch.rand(n, device=device).square()).clamp_min(1e-6)
+    y = distance if name == "wall_b" else 1.0 - distance
+    return torch.stack([x, y], dim=1)
+
+
+def sample_near_device_boundary(name, n, width, x1, x2, device):
+    """Sample points inside a device and close to its material boundary."""
+    if n <= 0:
+        return torch.empty((0, 2), device=device)
+    x1f, x2f = float(x1), float(x2)
+    if name in {"dev1", "dev2"}:
+        side = C.D1 if name == "dev1" else C.D2
+        xc = x1f if name == "dev1" else x2f
+        yr = C.DEV1_Y if name == "dev1" else C.DEV2_Y
+        width = min(width, side / 2)
+        points = _box(max(2 * n, 128), xc - side / 2, xc + side / 2,
+                      yr[0], yr[1], device)
+        distance = torch.minimum(
+            torch.minimum(points[:, 0] - (xc - side / 2),
+                          (xc + side / 2) - points[:, 0]),
+            torch.minimum(points[:, 1] - yr[0], yr[1] - points[:, 1]))
+        selected = points[distance <= width]
+        while selected.shape[0] < n:
+            more = _box(max(2 * (n - selected.shape[0]), 128),
+                        xc - side / 2, xc + side / 2, yr[0], yr[1], device)
+            d = torch.minimum(
+                torch.minimum(more[:, 0] - (xc - side / 2),
+                              (xc + side / 2) - more[:, 0]),
+                torch.minimum(more[:, 1] - yr[0], yr[1] - more[:, 1]))
+            selected = torch.cat((selected, more[d <= width]), dim=0)
+        return selected[:n]
+    if name == "dev3":
+        inner = max(0.0, C.R3 - width)
+        u = torch.rand(n, device=device)
+        radius = torch.sqrt(inner ** 2 + u * (C.R3 ** 2 - inner ** 2))
+        angle = 2 * math.pi * torch.rand(n, device=device)
+        return torch.stack([C.C3[0] + radius * torch.cos(angle),
+                            C.C3[1] + radius * torch.sin(angle)], dim=1)
+    raise KeyError(name)
+
+
+def sample_near_wall_surface(name, n, width, device):
+    """Sample points inside a wall strip near one named inner/outer face."""
+    if n <= 0:
+        return torch.empty((0, 2), device=device)
+    dom, face = name.rsplit("_", 1)
+    if dom not in G.WALL_STRIPS or face not in {"inner", "outer"}:
+        raise KeyError(name)
+    x0, x1, y0, y1 = G.WALL_STRIPS[dom]
+    if dom == "wall_l":
+        lo, hi = ((x0, min(x0 + width, x1)) if face == "outer"
+                  else (max(x1 - width, x0), x1))
+        return _box(n, lo, hi, y0, y1, device)
+    if dom == "wall_r":
+        lo, hi = ((max(x1 - width, x0), x1) if face == "outer"
+                  else (x0, min(x0 + width, x1)))
+        return _box(n, lo, hi, y0, y1, device)
+    if dom == "wall_b":
+        lo, hi = ((y0, min(y0 + width, y1)) if face == "outer"
+                  else (max(y1 - width, y0), y1))
+        return _box(n, x0, x1, lo, hi, device)
+    lo, hi = ((max(y1 - width, y0), y1) if face == "outer"
+              else (y0, min(y0 + width, y1)))
+    return _box(n, x0, x1, lo, hi, device)
+
+
+def sample_air_near(name, n, width, x1, x2, device):
+    """Sample air points in a narrow layer next to a device or long wall."""
+    if n <= 0:
+        return torch.empty((0, 2), device=device)
+    x1f, x2f = float(x1), float(x2)
+    points = []
+    needed = n
+    while needed > 0:
+        if name in {"wall_b", "wall_t"}:
+            if name == "wall_b":
+                candidates = _box(max(3 * needed, 256), C.W_IN,
+                                  1 - C.W_IN, C.W_IN,
+                                  C.W_IN + width, device)
+            else:
+                candidates = _box(max(3 * needed, 256), C.W_IN,
+                                  1 - C.W_IN, 1 - C.W_IN - width,
+                                  1 - C.W_IN, device)
+        elif name in {"dev1", "dev2"}:
+            side = C.D1 if name == "dev1" else C.D2
+            xc = x1f if name == "dev1" else x2f
+            yr = C.DEV1_Y if name == "dev1" else C.DEV2_Y
+            candidates = _box(max(5 * needed, 256),
+                              xc - side / 2 - width,
+                              xc + side / 2 + width,
+                              yr[0] - width, yr[1] + width, device)
+            dx = torch.clamp(torch.abs(candidates[:, 0] - xc)
+                             - side / 2, min=0.0)
+            yc = (yr[0] + yr[1]) / 2
+            dy = torch.clamp(torch.abs(candidates[:, 1] - yc)
+                             - side / 2, min=0.0)
+            close = torch.sqrt(dx ** 2 + dy ** 2) <= width
+            candidates = candidates[close]
+        elif name.startswith(("dev1_air_", "dev2_air_")):
+            dev, face = name.split("_air_", 1)
+            side = C.D1 if dev == "dev1" else C.D2
+            xc = x1f if dev == "dev1" else x2f
+            yr = C.DEV1_Y if dev == "dev1" else C.DEV2_Y
+            xl, xr = xc - side / 2, xc + side / 2
+            if face == "left":
+                candidates = _box(max(2 * needed, 256),
+                                  xl - width, xl, yr[0], yr[1], device)
+            elif face == "right":
+                candidates = _box(max(2 * needed, 256),
+                                  xr, xr + width, yr[0], yr[1], device)
+            elif face == "bottom" and dev == "dev2":
+                candidates = _box(max(2 * needed, 256),
+                                  xl, xr, yr[0] - width, yr[0], device)
+            elif face == "top" and dev == "dev1":
+                candidates = _box(max(2 * needed, 256),
+                                  xl, xr, yr[1], yr[1] + width, device)
+            else:
+                raise KeyError(name)
+        elif name == "dev3":
+            angle = 2 * math.pi * torch.rand(max(2 * needed, 256),
+                                               device=device)
+            radius = torch.sqrt(C.R3 ** 2 + torch.rand_like(angle)
+                                * ((C.R3 + width) ** 2 - C.R3 ** 2))
+            candidates = torch.stack(
+                [C.C3[0] + radius * torch.cos(angle),
+                 C.C3[1] + radius * torch.sin(angle)], dim=1)
+        else:
+            raise KeyError(name)
+        keep = G.mask_air(candidates, x1f, x2f)
+        selected = candidates[keep][:needed]
+        points.append(selected)
+        needed -= selected.shape[0]
+    return torch.cat(points, dim=0)
+
+
+def _sample_count(spec, name):
+    """Resolve a scalar or per-name sample-count specification."""
+    if isinstance(spec, dict):
+        if name not in spec:
+            raise KeyError(f"missing sample count for {name}")
+        return int(spec[name])
+    return int(spec)
+
+
 def sample_interface(name, n, x1, x2, device, deterministic=False):
     """Return interface points and a shared unit derivative direction."""
     x1f, x2f = float(x1), float(x2)
@@ -193,8 +349,9 @@ def sample_all_interfaces(n, x1, x2, device, deterministic=False):
     """Sample every active interface and attach its topology metadata."""
     samples = {}
     for name, domain_a, domain_b in G.INTERFACES:
+        count = _sample_count(n, name)
         points, directions = sample_interface(
-            name, n, x1, x2, device, deterministic=deterministic)
+            name, count, x1, x2, device, deterministic=deterministic)
         samples[name] = dict(pts=points, dirs=directions,
                              a=domain_a, b=domain_b)
     return samples
@@ -203,28 +360,34 @@ def sample_all_interfaces(n, x1, x2, device, deterministic=False):
 def sample_boundaries(n, device, deterministic=False):
     """Sample outer boundaries and identify the owning temperature branch."""
     boundaries = {}
-    vline = (lambda x, yr: _line_midpoints(
-        n, (x, yr[0]), (x, yr[1]), device)) if deterministic else \
-        (lambda x, yr: _vertical_line(n, x, yr, device))
-    hline = (lambda xr, y: _line_midpoints(
-        n, (xr[0], y), (xr[1], y), device)) if deterministic else \
-        (lambda xr, y: _box(n, xr[0], xr[1], y, y, device))
+    def vline(name, x, yr):
+        count = _sample_count(n, name)
+        return (_line_midpoints(count, (x, yr[0]), (x, yr[1]), device)
+                if deterministic else _vertical_line(count, x, yr, device))
+
+    def hline(name, xr, y):
+        count = _sample_count(n, name)
+        return (_line_midpoints(count, (xr[0], y), (xr[1], y), device)
+                if deterministic else _box(count, xr[0], xr[1], y, y,
+                                            device))
     if C.USE_TBL_1D:
         # Robin resistance from wall_l at x=0 to the cold reservoir.
         boundaries["left"] = dict(
-            pts=vline(0.0, (0.0, 1.0)), dom="wall_l")
+            pts=vline("left", 0.0, (0.0, 1.0)), dom="wall_l")
     else:
         boundaries["left"] = dict(
-            pts=vline(C.X_TBL, (0.0, 1.0)), dom="tbl")
+            pts=vline("left", C.X_TBL, (0.0, 1.0)), dom="tbl")
 
     boundaries["right"] = dict(
-        pts=vline(1.0, (0.0, 1.0)), dom="wall_r")
+        pts=vline("right", 1.0, (0.0, 1.0)), dom="wall_r")
 
     if not C.USE_TBL_1D:
         for side, y in [("top", 1.0), ("bottom", 0.0)]:
             boundaries[f"{side}_tbl"] = dict(
-                pts=hline((C.X_TBL, 0.0), y), dom="tbl",
-                dirs=torch.tensor([0.0, 1.0], device=device).expand(n, 2))
+                pts=hline(f"{side}_tbl", (C.X_TBL, 0.0), y), dom="tbl")
+            count = boundaries[f"{side}_tbl"]["pts"].shape[0]
+            boundaries[f"{side}_tbl"]["dirs"] = torch.tensor(
+                [0.0, 1.0], device=device).expand(count, 2)
 
     # y=0/1 spans wall_l, wall_b/wall_t and wall_r.
     for side, y in [("top", 1.0), ("bottom", 0.0)]:
@@ -233,7 +396,10 @@ def sample_boundaries(n, device, deterministic=False):
                   (middle, (C.W_IN, 1 - C.W_IN)),
                   ("wall_r", (1 - C.W_IN, 1.0))]
         for strip, (x0, x1_) in strips:
-            boundaries[f"{side}_{strip}"] = dict(
-                pts=hline((x0, x1_), y), dom=strip,
-                dirs=torch.tensor([0.0, 1.0], device=device).expand(n, 2))
+            key = f"{side}_{strip}"
+            pts = hline(key, (x0, x1_), y)
+            boundaries[key] = dict(
+                pts=pts, dom=strip,
+                dirs=torch.tensor([0.0, 1.0], device=device).expand(
+                    pts.shape[0], 2))
     return boundaries

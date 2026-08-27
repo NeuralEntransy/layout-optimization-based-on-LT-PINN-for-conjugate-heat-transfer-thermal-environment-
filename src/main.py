@@ -70,6 +70,10 @@ def parse_args():
                    help="resample collocation points every N L-BFGS steps "
                         "(0 = keep fixed)")
     p.add_argument("--lr", type=float, default=C.TRAIN["lr"])
+    p.add_argument("--lr-scheduler", choices=["none", "cosine"],
+                   default=C.TRAIN["lr_scheduler"],
+                   help="Adam learning-rate schedule; 'none' keeps --lr "
+                        "constant (default)")
     p.add_argument("--width", type=int, default=C.TRAIN["width"])
     p.add_argument("--depth", type=int, default=C.TRAIN["depth"])
     p.add_argument("--power-scale", type=float,
@@ -87,28 +91,22 @@ def parse_args():
     p.add_argument("--ramp-frac", type=float,
                    default=C.TRAIN["ramp_frac"],
                    help="fraction of epochs over which power ramps up")
-    p.add_argument("--loss-ramp-frac", type=float,
-                   default=C.TRAIN["loss_ramp_frac"],
-                   help="fraction of Adam epochs used to ramp changed loss "
-                        "weights to their requested end values")
     p.add_argument("--w-pde", type=float, default=C.TRAIN["w_pde"])
     p.add_argument("--w-pde-dev", type=float, default=C.TRAIN["w_pde_dev"])
-    p.add_argument("--w-pde-dev-start", type=float,
-                   default=C.TRAIN["w_pde_dev_start"])
     p.add_argument("--w-eng", type=float, default=C.TRAIN["w_eng"])
-    p.add_argument("--w-eng-start", type=float,
-                   default=C.TRAIN["w_eng_start"])
     p.add_argument("--eng-w-device", type=float,
                    default=C.TRAIN["eng_w_device"],
                    help="inner weight of per-device double-sided budgets")
+    p.add_argument("--eng-w-face", type=float,
+                   default=C.TRAIN["eng_w_face"],
+                   help="inner weight of per-interface integrated "
+                        "two-sided flux continuity")
     p.add_argument("--eng-w-air", type=float,
                    default=C.TRAIN["eng_w_air"],
                    help="inner weight of the source-free air balance")
     p.add_argument("--eng-w-wall", type=float,
                    default=C.TRAIN["eng_w_wall"],
                    help="inner weight of source-free wall balances")
-    p.add_argument("--eng-w-wall-start", type=float,
-                   default=C.TRAIN["eng_w_wall_start"])
     p.add_argument("--eng-w-global", type=float,
                    default=C.TRAIN["eng_w_global"],
                    help="inner weight of the four-side global balance")
@@ -121,8 +119,9 @@ def parse_args():
     p.add_argument("--w-if-T", type=float, default=C.TRAIN["w_if_T"])
     p.add_argument("--w-if-q", type=float, default=C.TRAIN["w_if_q"])
     p.add_argument("--w-bc", type=float, default=C.TRAIN["w_bc"])
-    p.add_argument("--w-bc-start", type=float,
-                   default=C.TRAIN["w_bc_start"])
+    p.add_argument("--bc-w-adiabatic", type=float,
+                   default=C.TRAIN["bc_w_adiabatic"],
+                   help="inner multiplier for pointwise top/bottom BC loss")
     p.add_argument("--fourier-sigma", type=float,
                    default=C.TRAIN["fourier_sigma"],
                    help="override per-domain Fourier sigma globally "
@@ -144,7 +143,7 @@ def parse_args():
     p.add_argument("--resume-lr", type=float, default=None,
                    help="override the current Adam learning rate after "
                         "loading a resume checkpoint; keeps optimizer "
-                        "moments and extends an exhausted cosine schedule")
+                        "moments and follows --lr-scheduler")
     p.add_argument("--init-from", default=None,
                    help="warm-start field weights from another checkpoint "
                         "with a fresh optimizer/scheduler; use a new ckptdir")
@@ -180,22 +179,18 @@ def main():
         raise ValueError("power scales must be positive")
     if not 0.0 <= args.ramp_frac <= 1.0:
         raise ValueError("--ramp-frac must lie in [0, 1]")
-    if not 0.0 <= args.loss_ramp_frac <= 1.0:
-        raise ValueError("--loss-ramp-frac must lie in [0, 1]")
     nonnegative_weights = {
         "w_pde": args.w_pde,
         "w_pde_dev": args.w_pde_dev,
-        "w_pde_dev_start": args.w_pde_dev_start,
         "w_if_T": args.w_if_T,
         "w_if_q": args.w_if_q,
         "w_bc": args.w_bc,
-        "w_bc_start": args.w_bc_start,
+        "bc_w_adiabatic": args.bc_w_adiabatic,
         "w_eng": args.w_eng,
-        "w_eng_start": args.w_eng_start,
         "eng_w_device": args.eng_w_device,
+        "eng_w_face": args.eng_w_face,
         "eng_w_air": args.eng_w_air,
         "eng_w_wall": args.eng_w_wall,
-        "eng_w_wall_start": args.eng_w_wall_start,
         "eng_w_global": args.eng_w_global,
         "eng_w_lr": args.eng_w_lr,
         "eng_w_adiabatic": args.eng_w_adiabatic,
@@ -294,10 +289,12 @@ def main():
     condLoss = ConductionLoss(field, power_scale=args.power_scale,
                               w_dev=args.w_pde_dev)
     ifaceLoss = InterfaceLoss(field)
-    bcLoss = BoundaryLoss(field, right_bc=args.right_bc)
+    bcLoss = BoundaryLoss(field, right_bc=args.right_bc,
+                          w_adiabatic=args.bc_w_adiabatic)
     engLoss = EnergyConservationLoss(
         field,
         w_device=args.eng_w_device,
+        w_face=args.eng_w_face,
         w_air=args.eng_w_air,
         w_wall=args.eng_w_wall,
         w_global=args.eng_w_global,
@@ -305,8 +302,16 @@ def main():
         w_adiabatic=args.eng_w_adiabatic)
 
     optimizer = torch.optim.Adam(field.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2)
+
+    def build_scheduler(base_lr, total_epochs):
+        if args.lr_scheduler == "none":
+            return torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=lambda _epoch: 1.0)
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, total_epochs),
+            eta_min=base_lr * 1e-2)
+
+    scheduler = build_scheduler(args.lr, args.epochs)
 
     start_epoch = 1
     ckpt_path = os.path.join(ckptdir, "latest.pt")
@@ -328,22 +333,18 @@ def main():
         ramp_frac=args.ramp_frac,
         ramp_total_epochs=(
             args.epochs if args.ramp != "none" else None),
-        loss_ramp_frac=args.loss_ramp_frac,
-        loss_ramp_total_epochs=(
-            args.epochs if args.loss_ramp_frac > 0.0 else None),
+        lr_scheduler=args.lr_scheduler,
         w_pde=args.w_pde,
         w_pde_dev=args.w_pde_dev,
-        w_pde_dev_start=args.w_pde_dev_start,
         w_if_T=args.w_if_T,
         w_if_q=args.w_if_q,
         w_bc=args.w_bc,
-        w_bc_start=args.w_bc_start,
+        bc_w_adiabatic=args.bc_w_adiabatic,
         w_eng=args.w_eng,
-        w_eng_start=args.w_eng_start,
         eng_w_device=args.eng_w_device,
+        eng_w_face=args.eng_w_face,
         eng_w_air=args.eng_w_air,
         eng_w_wall=args.eng_w_wall,
-        eng_w_wall_start=args.eng_w_wall_start,
         eng_w_global=args.eng_w_global,
         eng_w_lr=args.eng_w_lr,
         eng_w_adiabatic=args.eng_w_adiabatic,
@@ -354,9 +355,18 @@ def main():
         n_energy=C.TRAIN["n_energy"],
         sampling=dict(
             n_dom=dict(C.TRAIN["n_dom"]),
-            n_iface=C.TRAIN["n_iface"],
-            n_bnd=C.TRAIN["n_bnd"],
+            n_near_device=dict(C.TRAIN["n_near_device"]),
+            device_layer_width=C.TRAIN["device_layer_width"],
+            n_near_wall=dict(C.TRAIN["n_near_wall"]),
+            wall_layer_width=C.TRAIN["wall_layer_width"],
+            n_near_air=dict(C.TRAIN["n_near_air"]),
+            air_layer_width=C.TRAIN["air_layer_width"],
+            n_iface=dict(C.TRAIN["n_iface"]),
+            n_bnd=dict(C.TRAIN["n_bnd"]),
             n_energy=C.TRAIN["n_energy"],
+            pde_microbatch=C.TRAIN["pde_microbatch"],
+            interface_microbatch=C.TRAIN["interface_microbatch"],
+            boundary_microbatch=C.TRAIN["boundary_microbatch"],
         ),
         runtime=dict(device=str(device), seed=args.seed),
         geometry=dict(
@@ -485,19 +495,25 @@ def main():
             for group in optimizer.param_groups:
                 group["lr"] = args.resume_lr
                 group["initial_lr"] = args.resume_lr
-            scheduler.base_lrs = [args.resume_lr] * len(optimizer.param_groups)
-            scheduler.eta_min = args.resume_lr * 1e-2
-            scheduler._last_lr = [args.resume_lr] * len(optimizer.param_groups)
-            old_t_max = scheduler.T_max
-            if scheduler.last_epoch >= old_t_max and args.epochs >= start_epoch:
-                remaining = args.epochs - ck["epoch"]
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=remaining,
-                    eta_min=args.resume_lr * 1e-2)
-                print(f"[resume] completed cosine schedule replaced by a "
-                      f"new {remaining}-epoch schedule")
+            if args.lr_scheduler == "none":
+                scheduler = build_scheduler(
+                    args.resume_lr, max(1, args.epochs - ck["epoch"]))
+                print("[resume] constant learning rate retained")
             else:
-                print("[resume] scheduler progress retained")
+                scheduler.base_lrs = [args.resume_lr] * len(
+                    optimizer.param_groups)
+                scheduler.eta_min = args.resume_lr * 1e-2
+                scheduler._last_lr = [args.resume_lr] * len(
+                    optimizer.param_groups)
+                old_t_max = scheduler.T_max
+                if (scheduler.last_epoch >= old_t_max
+                        and args.epochs >= start_epoch):
+                    remaining = args.epochs - ck["epoch"]
+                    scheduler = build_scheduler(args.resume_lr, remaining)
+                    print(f"[resume] completed cosine schedule replaced by "
+                          f"a new {remaining}-epoch schedule")
+                else:
+                    print("[resume] cosine scheduler progress retained")
             print(f"[resume] learning rate overridden to {args.resume_lr:g}")
     elif args.resume:
         raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
@@ -563,7 +579,8 @@ def main():
           f"loss={C.LOSS_VERSION}  "
           f"right_bc={args.right_bc}  x1={float(x1):.4f}  "
           f"x2={float(x2):.4f}  device={device}  "
-          f"power_scale={args.power_scale}")
+          f"power_scale={args.power_scale}  lr={args.lr:g}  "
+          f"lr_scheduler={args.lr_scheduler}")
     print(f"ckptdir={ckptdir}\noutdir={outdir}")
     # Plot/log setup is outside the mathematical training objective. Preserve
     # the post-initialization (or restored checkpoint) random stream so those
@@ -596,7 +613,8 @@ def main():
         "Q_right_robin", "right_T_rms_err_K", "balance_lr_err",
         "balance_err", "adiabatic_net_leak", "adiabatic_leak",
         "Tmax1_C", "Tmax2_C", "Tmax3_C", "lr",
-        "w_pde_dev", "w_bc", "w_eng", "eng_w_wall", "sec",
+        "w_pde_dev", "w_bc", "w_eng", "eng_w_face", "eng_w_wall",
+        "sec",
     ]
 
     passive_domains = ["wall_l", "wall_r", "wall_b", "wall_t"]
@@ -613,6 +631,13 @@ def main():
             energy_residual_keys.append(f"eng_{dev_name}_{side_name}")
             energy_heat_keys.append(
                 f"eng_Q_{dev_name}_{side_name}_W")
+        for iface_name in G.DEV_IFACES[dev_name]:
+            energy_residual_keys.append(f"eng_face_{iface_name}")
+            energy_heat_keys.extend([
+                f"eng_Q_{iface_name}_dev_W",
+                f"eng_Q_{iface_name}_recv_W",
+                f"eng_dQ_{iface_name}_W",
+            ])
     energy_residual_keys.append("eng_air")
     energy_heat_keys.append("eng_Q_air_W")
     for dom_name in passive_domains:
@@ -628,7 +653,8 @@ def main():
     energy_heat_keys.extend(
         ["eng_Q_left_W", "eng_Q_right_W", "eng_Q_outer_W"])
     energy_component_keys = [
-        "eng_loss_device", "eng_loss_air", "eng_loss_wall",
+        "eng_loss_device", "eng_loss_face", "eng_loss_air",
+        "eng_loss_wall",
         "eng_loss_global", "eng_loss_lr", "eng_loss_adiabatic",
         "eng_loss_total",
     ]
@@ -709,45 +735,121 @@ def main():
         w_bc=args.w_bc,
         w_eng=args.w_eng,
         w_pde_dev=args.w_pde_dev,
+        eng_w_face=args.eng_w_face,
         eng_w_wall=args.eng_w_wall,
     )
 
-    def set_active_loss_weights(epoch, force_final=False):
-        if force_final or args.loss_ramp_frac <= 0.0:
-            fraction = 1.0
-        else:
-            ramp_epochs = max(1.0, args.loss_ramp_frac * args.epochs)
-            fraction = min(max(epoch / ramp_epochs, 0.0), 1.0)
+    def sample_domains():
+        domains = {d: S.sample_domain(d, nd[d], x1, x2, device)
+                   for d in G.DOMAINS}
+        for d, count in C.TRAIN["n_near_device"].items():
+            local = S.sample_near_device_boundary(
+                d, count, C.TRAIN["device_layer_width"], x1, x2, device)
+            domains[d] = torch.cat((domains[d], local), dim=0)
+        for name, count in C.TRAIN["n_near_wall"].items():
+            dom = name.rsplit("_", 1)[0]
+            local = S.sample_near_wall_surface(
+                name, count, C.TRAIN["wall_layer_width"], device)
+            domains[dom] = torch.cat((domains[dom], local), dim=0)
+        air_layers = [S.sample_air_near(
+            name, count, C.TRAIN["air_layer_width"], x1, x2, device)
+            for name, count in C.TRAIN["n_near_air"].items()]
+        domains["air"] = torch.cat([domains["air"]] + air_layers, dim=0)
+        return domains
 
-        def interpolate(start, end):
-            return start + fraction * (end - start)
+    def sample_chunks(sample, chunk_size):
+        count = sample["pts"].shape[0]
+        for start in range(0, count, chunk_size):
+            stop = min(start + chunk_size, count)
+            chunk = {}
+            for key, value in sample.items():
+                if (torch.is_tensor(value) and value.ndim > 0
+                        and value.shape[0] == count):
+                    chunk[key] = value[start:stop]
+                else:
+                    chunk[key] = value
+            yield chunk, (stop - start) / count
 
-        active_weights["w_pde_dev"] = interpolate(
-            args.w_pde_dev_start, args.w_pde_dev)
-        active_weights["w_bc"] = interpolate(
-            args.w_bc_start, args.w_bc)
-        active_weights["w_eng"] = interpolate(
-            args.w_eng_start, args.w_eng)
-        active_weights["eng_w_wall"] = interpolate(
-            args.eng_w_wall_start, args.eng_w_wall)
-        condLoss.w_dev = active_weights["w_pde_dev"]
-        engLoss.w_wall = active_weights["eng_w_wall"]
+    def tensor_chunks(points, chunk_size):
+        count = points.shape[0]
+        for start in range(0, count, chunk_size):
+            stop = min(start + chunk_size, count)
+            yield points[start:stop], (stop - start) / count
 
-    def compute_loss(dom_samples, if_samples, bnd_samples):
-        l_pde, pde_details = condLoss(dom_samples)
-        l_ifT, l_ifq, iface_details = ifaceLoss(if_samples)
-        l_bc, bc_details = bcLoss(bnd_samples)
+    def accumulate_pointwise(dom_samples, if_samples, bnd_samples,
+                             do_backward):
+        """Evaluate exact mean losses in microbatches and optionally backprop."""
+        zero = torch.zeros((), device=device)
+        totals = dict(pde=zero, ifT=zero, ifq=zero, bc=zero)
+        details = {}
+
+        def consume(value, outer_weight):
+            if do_backward:
+                (outer_weight * value).backward()
+
+        for dom, points in dom_samples.items():
+            key = f"pde_{dom}"
+            detail = zero
+            for chunk, fraction in tensor_chunks(
+                    points, C.TRAIN["pde_microbatch"]):
+                loss_part, part_details = condLoss({dom: chunk})
+                scaled = fraction * loss_part
+                consume(scaled, args.w_pde)
+                detail = detail + fraction * part_details[key].detach()
+            totals["pde"] = totals["pde"] + detail
+            details[key] = detail
+
+        for name, sample in if_samples.items():
+            value_T, value_q = zero, zero
+            for chunk, fraction in sample_chunks(
+                    sample, C.TRAIN["interface_microbatch"]):
+                l_T, l_q, _ = ifaceLoss({name: chunk})
+                if do_backward:
+                    (fraction * (args.w_if_T * l_T
+                                 + args.w_if_q * l_q)).backward()
+                value_T = value_T + fraction * l_T.detach()
+                value_q = value_q + fraction * l_q.detach()
+            totals["ifT"] = totals["ifT"] + value_T
+            totals["ifq"] = totals["ifq"] + value_q
+            details[f"ifT_{name}"] = value_T
+            details[f"ifq_{name}"] = value_q
+
+        for name, sample in bnd_samples.items():
+            detail_key = (left_bc_key if name == "left" else
+                          right_bc_key if name == "right" else
+                          f"bc_{name}_adiab")
+            value = zero
+            for chunk, fraction in sample_chunks(
+                    sample, C.TRAIN["boundary_microbatch"]):
+                loss_part, _ = bcLoss({name: chunk})
+                consume(fraction * loss_part, active_weights["w_bc"])
+                # BoundaryLoss includes the inner adiabatic multiplier in its
+                # total, while physics_log intentionally stores the raw term.
+                raw = (loss_part / bcLoss.w_adiabatic
+                       if name.startswith(("top_", "bottom_"))
+                       else loss_part)
+                value = value + fraction * raw.detach()
+                totals["bc"] = totals["bc"] + fraction * loss_part.detach()
+            details[detail_key] = value
+        return totals, details
+
+    def accumulated_loss(dom_samples, if_samples, bnd_samples,
+                         do_backward=False):
+        point, physics_details = accumulate_pointwise(
+            dom_samples, if_samples, bnd_samples, do_backward)
         engLoss.power_scale = condLoss.power_scale
         l_eng, eng_details = engLoss(eng_if_samples, eng_bnd_samples)
-        loss = (args.w_pde * l_pde + args.w_if_T * l_ifT
-                + args.w_if_q * l_ifq
-                + active_weights["w_bc"] * l_bc
-                + active_weights["w_eng"] * l_eng)
-        physics_details = {}
-        physics_details.update(pde_details)
-        physics_details.update(iface_details)
-        physics_details.update(bc_details)
-        return (loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng),
+        if do_backward:
+            (active_weights["w_eng"] * l_eng).backward()
+        l_eng_detached = l_eng.detach()
+        total = (args.w_pde * point["pde"]
+                 + args.w_if_T * point["ifT"]
+                 + args.w_if_q * point["ifq"]
+                 + active_weights["w_bc"] * point["bc"]
+                 + active_weights["w_eng"] * l_eng_detached)
+        return (total.detach(),
+                (point["pde"], point["ifT"], point["ifq"],
+                 point["bc"], l_eng_detached),
                 eng_details, physics_details)
 
     def write_detail_log(path, header, epoch, phase, details):
@@ -776,19 +878,14 @@ def main():
         ## sample collocation points
         t0 = time.time()
         condLoss.power_scale = power_at(epoch)
-        set_active_loss_weights(epoch)
-
-        dom_samples = {d: S.sample_domain(d, nd[d], x1, x2, device)
-                       for d in G.DOMAINS}
+        dom_samples = sample_domains()
         if_samples = S.sample_all_interfaces(n_if, x1, x2, device)
         bnd_samples = S.sample_boundaries(n_bnd, device)
-        ## compute loss and backprop
+        ## Accumulate exact mean-loss gradients over memory-bounded chunks.
+        optimizer.zero_grad(set_to_none=True)
         loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng), eng_details, \
-            physics_details = compute_loss(
-                dom_samples, if_samples, bnd_samples)
-
-        optimizer.zero_grad()
-        loss.backward()
+            physics_details = accumulated_loss(
+                dom_samples, if_samples, bnd_samples, do_backward=True)
         optimizer.step()
         scheduler.step()
         reported_loss = loss
@@ -800,8 +897,8 @@ def main():
             # CSV row describes the same field state.
             reported_loss, (
                 l_pde, l_ifT, l_ifq, l_bc, l_eng
-            ), eng_details, physics_details = compute_loss(
-                dom_samples, if_samples, bnd_samples)
+            ), eng_details, physics_details = accumulated_loss(
+                dom_samples, if_samples, bnd_samples, do_backward=False)
             ps_now = condLoss.power_scale
             flux = M.energy_report(field, device, ps_now, n=257,
                                    right_bc=args.right_bc)
@@ -820,6 +917,7 @@ def main():
                    active_weights["w_pde_dev"],
                    active_weights["w_bc"],
                    active_weights["w_eng"],
+                   active_weights["eng_w_face"],
                    active_weights["eng_w_wall"],
                    time.time() - t0]
             with open(log_path, "a", newline="") as f:
@@ -857,7 +955,6 @@ def main():
     # takes big steps along it.  Collocation points are fixed per step block.
     if args.lbfgs_steps > 0:
         condLoss.power_scale = args.power_scale
-        set_active_loss_weights(args.epochs, force_final=True)
         print(f"[lbfgs] {args.lbfgs_steps} steps at fixed power "
               f"{args.power_scale:g}")
         def _new_lbfgs():
@@ -869,8 +966,7 @@ def main():
         lb = _new_lbfgs()
 
         def _samples():
-            return ({d: S.sample_domain(d, nd[d], x1, x2, device)
-                     for d in G.DOMAINS},
+            return (sample_domains(),
                     S.sample_all_interfaces(n_if, x1, x2, device),
                     S.sample_boundaries(n_bnd, device))
 
@@ -886,9 +982,9 @@ def main():
                       f"before step {step}")
 
             def closure():
-                lb.zero_grad()
-                l, _, _, _ = compute_loss(*fixed)
-                l.backward()
+                lb.zero_grad(set_to_none=True)
+                l, _, _, _ = accumulated_loss(
+                    *fixed, do_backward=True)
                 return l
 
             t0 = time.time()
@@ -896,7 +992,8 @@ def main():
             display_loss = l_val
             if step % 10 == 0 or step == args.lbfgs_steps:
                 current_loss, (l_pde, l_ifT, l_ifq, l_bc, l_eng), \
-                    eng_details, physics_details = compute_loss(*fixed)
+                    eng_details, physics_details = accumulated_loss(
+                        *fixed, do_backward=False)
                 display_loss = current_loss
                 flux = M.energy_report(field, device, args.power_scale,
                                        n=257, right_bc=args.right_bc)
@@ -917,6 +1014,7 @@ def main():
                        active_weights["w_pde_dev"],
                        active_weights["w_bc"],
                        active_weights["w_eng"],
+                       active_weights["eng_w_face"],
                        active_weights["eng_w_wall"],
                        time.time() - t0]
                 with open(log_path, "a", newline="") as f:
